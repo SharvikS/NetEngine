@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import PyQt6; import psutil; print\\('PyQt6:', PyQt6.__version__ if hasattr\\(PyQt6,'__version__'\\) else 'ok'\\); print\\('psutil ok'\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import PyQt6, psutil; print\\('PyQt6 ok'\\); print\\('psutil ok'\\)\")",
+      "Bash(python:*)",
+      "Bash(where ssh:*)",
+      "Bash(where scp:*)",
+      "Bash(where netsh:*)",
+      "Bash(where ipconfig:*)",
+      "Bash(mkdir -p \"C:/Users/sharvik admin/AppData/Local/Temp/ne_debug\")",
+      "Read(//c/Users/sharvik admin/AppData/Local/Temp/ne_debug/**)",
+      "Bash(xargs wc:*)",
+      "Bash(PYTHONIOENCODING=utf-8 python -u tests/crash_harness.py)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(timeout 120 python -u tests/crash_harness.py)",
+      "Read(//tmp/**)"
+    ]
+  }
+}
