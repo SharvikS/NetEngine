@@ -46,7 +46,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QInputDialog, QCheckBox, QTabBar, QStackedWidget,
     QToolButton,
 )
-from PyQt6.QtGui import QIcon, QColor, QIntValidator, QShortcut, QKeySequence
+from PyQt6.QtGui import QColor, QIcon, QIntValidator, QKeySequence, QShortcut
 
 from gui.components.collapsible import CollapsibleSection
 from gui.components.live_widgets import StatusDot
@@ -670,6 +670,7 @@ class SSHView(QWidget):
 
         # ── Tab area ─────────────────────────────────────────────────────
         self._tabs = QTabWidget()
+        self._tabs.setObjectName("ssh_tabs")
         self._tabs.setTabsClosable(True)
         self._tabs.setMovable(True)
         self._tabs.setDocumentMode(False)

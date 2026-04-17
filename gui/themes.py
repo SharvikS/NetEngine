@@ -843,6 +843,15 @@ QTabBar::tab:hover:!selected {{
     color: {t.text};
     border-color: {t.border_lt};
 }}
+/* Tab close button — minimal, theme-matching. */
+QTabBar::close-button {{
+    subcontrol-position: right;
+    padding: 4px;
+}}
+QTabBar::close-button:hover {{
+    background: {t.bg_hover};
+    border-radius: 3px;
+}}
 
 /* ── Menu ─────────────────────────────────────────────────────── */
 QMenuBar {{

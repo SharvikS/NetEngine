@@ -594,10 +594,10 @@ class LoadingScreen(QWidget):
         # Spin.
         p.rotate(self._logo_angle)
 
-        # Hexagon path.
+        # Hexagon path — pointy-top orientation matching the app sidebar logo.
         hex_path = QPainterPath()
         for i in range(6):
-            ang = math.radians(60 * i - 30)
+            ang = math.radians(-90 + i * 60)
             x = math.cos(ang) * r
             y = math.sin(ang) * r
             if i == 0:
@@ -606,70 +606,85 @@ class LoadingScreen(QWidget):
                 hex_path.lineTo(x, y)
         hex_path.closeSubpath()
 
-        # Inner fill — dark with a subtle accent radial so the logo
-        # reads as a rim-lit solid, not flat.
-        fill = QRadialGradient(QPointF(0, 0), r)
-        fill.setColorAt(0.0, QColor(deep.red(), deep.green(), deep.blue(), 235))
-        mix = QColor(accent)
-        mix.setAlpha(30)
-        fill.setColorAt(0.85, QColor(deep.red(), deep.green(), deep.blue(), 255))
-        fill.setColorAt(1.0, mix)
-        p.setBrush(QBrush(fill))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawPath(hex_path)
+        # Multi-stroke outer glow (matching app sidebar logo style).
+        boost = max(0.0, min(1.0, (self._glow_render - 0.45) / 0.50))
+        glow_peak = 28 + 100 * self._glow_render + 55 * boost
+        for stroke_w, alpha_scale in (
+            (8.5, 0.20),
+            (6.0, 0.35),
+            (3.8, 0.60),
+            (2.2, 0.90),
+        ):
+            c = QColor(accent)
+            c.setAlpha(max(0, min(255, int(glow_peak * alpha_scale))))
+            gp = QPen(c)
+            gp.setWidthF(stroke_w)
+            gp.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            gp.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(gp)
+            p.drawPath(hex_path)
 
-        # Outer stroke.
-        stroke = QColor(accent)
-        stroke.setAlpha(255)
-        outer_pen = QPen(stroke, 2.6)
-        outer_pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
-        p.setPen(outer_pen)
+        # Fill gradient.
+        grad = QLinearGradient(0, -r, 0, r)
+        fill_top = QColor(accent)
+        fill_top.setAlpha(int(48 + 45 * self._glow_render + 30 * boost))
+        fill_bot = QColor(accent2 if boost > 0 else accent)
+        fill_bot.setAlpha(int(18 + 28 * boost))
+        grad.setColorAt(0.0, fill_top)
+        grad.setColorAt(1.0, fill_bot)
+        p.fillPath(hex_path, grad)
+
+        # Border — lerps toward accent2 on hover.
+        border_col = QColor(accent)
+        if boost > 0:
+            border_col.setRedF(min(1.0,
+                border_col.redF() * (1 - 0.35 * boost)
+                + accent2.redF() * 0.35 * boost))
+            border_col.setGreenF(min(1.0,
+                border_col.greenF() * (1 - 0.35 * boost)
+                + accent2.greenF() * 0.35 * boost))
+            border_col.setBlueF(min(1.0,
+                border_col.blueF() * (1 - 0.35 * boost)
+                + accent2.blueF() * 0.35 * boost))
+        border_pen = QPen(border_col)
+        border_pen.setWidthF(2.6 + 0.5 * boost)
+        border_pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+        p.setPen(border_pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(hex_path)
 
-        # Inner concentric hexagon.
-        inner = QPainterPath()
-        rr = r * 0.62
-        for i in range(6):
-            ang = math.radians(60 * i - 30)
-            x = math.cos(ang) * rr
-            y = math.sin(ang) * rr
-            if i == 0: inner.moveTo(x, y)
-            else:      inner.lineTo(x, y)
-        inner.closeSubpath()
-        inner_c = QColor(accent2)
-        inner_c.setAlpha(180)
-        p.setPen(QPen(inner_c, 1.2))
-        p.drawPath(inner)
+        # '>_' glyph — the real Net Engine logo.
+        s = r
+        glyph_alpha = int(220 + 35 * self._glow_render)
+        glyph_color = QColor(255, 255, 255, min(255, glyph_alpha))
+        gpen = QPen(glyph_color)
+        gpen.setWidthF(3.2 + 0.6 * boost)
+        gpen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        gpen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(gpen)
+        # chevron '>'
+        p.drawLine(QPointF(-s * 0.36, -s * 0.32),
+                   QPointF(-s * 0.02,  0.0))
+        p.drawLine(QPointF(-s * 0.02,  0.0),
+                   QPointF(-s * 0.36,  s * 0.32))
+        # underscore '_'
+        p.drawLine(QPointF( s * 0.08,  s * 0.40),
+                   QPointF( s * 0.48,  s * 0.40))
 
-        # Node graph inside — six radial spokes with end-dots, like a
-        # little network topology. Reads as "Net Engine" at a glance.
-        spoke_pen = QPen(QColor(accent), 1.4)
-        spoke_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(spoke_pen)
-        node_r = 3.2
-        for i in range(6):
-            ang = math.radians(60 * i)
-            x = math.cos(ang) * rr * 0.9
-            y = math.sin(ang) * rr * 0.9
-            p.drawLine(QPointF(0, 0), QPointF(x, y))
+        # Tiny corner network node — halo + dot.
+        node_x =  s * 0.58
+        node_y = -s * 0.58
+        halo_src = accent2 if self._hover else accent
+        halo_c = QColor(halo_src)
+        halo_c.setAlpha(int(35 + 90 * self._glow_render + 50 * boost))
         p.setPen(Qt.PenStyle.NoPen)
-        for i in range(6):
-            ang = math.radians(60 * i)
-            x = math.cos(ang) * rr * 0.9
-            y = math.sin(ang) * rr * 0.9
-            p.setBrush(QBrush(QColor(accent2)))
-            p.drawEllipse(QPointF(x, y), node_r, node_r)
-
-        # Central hub node.
-        hub_grad = QRadialGradient(QPointF(0, 0), 10)
-        hub_grad.setColorAt(0.0, QColor(255, 255, 255, 230))
-        hc = QColor(accent)
-        hc.setAlpha(180)
-        hub_grad.setColorAt(0.6, hc)
-        hub_grad.setColorAt(1.0, QColor(accent.red(), accent.green(), accent.blue(), 0))
-        p.setBrush(QBrush(hub_grad))
-        p.drawEllipse(QPointF(0, 0), 10, 10)
+        p.setBrush(QBrush(halo_c))
+        halo_r = 4.5 + 3.5 * self._glow_render + 2.0 * boost
+        p.drawEllipse(QPointF(node_x, node_y), halo_r, halo_r)
+        dot_c = QColor(accent)
+        dot_c.setAlpha(235)
+        p.setBrush(QBrush(dot_c))
+        p.drawEllipse(QPointF(node_x, node_y), 2.4, 2.4)
 
         p.restore()
 
@@ -705,15 +720,16 @@ class LoadingScreen(QWidget):
                         red: QColor) -> None:
         # A left-aligned block sitting below the wordmark.
         left = self._W / 2 - 210
-        top  = self._H / 2 + self._RING_RADIUS + 48
-        line_h = 20
+        top  = self._H / 2 + self._RING_RADIUS + 40
+        line_h = 18
 
         mono = QFont("Consolas", 10)
         mono.setWeight(QFont.Weight.DemiBold)
         p.setFont(mono)
 
-        # Only keep the last N lines visible so nothing gets clipped.
-        visible_n = 6
+        # Only keep the last N lines visible so they don't overlap
+        # the progress bar below.
+        visible_n = 4
         recent = self._lines[-visible_n:]
         y = top
         for ln in recent:
@@ -758,7 +774,7 @@ class LoadingScreen(QWidget):
         bar_w = 460
         bar_h = 2
         x = (self._W - bar_w) / 2
-        y = self._H - 66
+        y = self._H - 44
 
         # Track.
         track = QColor(accent)
@@ -798,7 +814,7 @@ class LoadingScreen(QWidget):
         lw = fm.horizontalAdvance(label)
         dim_col = QColor(accent); dim_col.setAlpha(170)
         p.setPen(QPen(dim_col))
-        p.drawText(QPointF((self._W - lw) / 2, y + 22), label)
+        p.drawText(QPointF((self._W - lw) / 2, y + 18), label)
 
     def _paint_corner_hud(self, p: QPainter, dim: QColor, accent: QColor) -> None:
         # Tiny HUD labels in the corners — pure atmosphere, but it
