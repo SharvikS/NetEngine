@@ -49,10 +49,13 @@ def main() -> int:
     app.setFont(QFont("Segoe UI", 10))
 
     # Attach theme manager → applies the active stylesheet.
-    ThemeManager.instance().attach(app)
+    tm = ThemeManager.instance()
+    tm.set_glass_opacity(settings.get("glass_opacity", 88))
+    tm.set_og_accent(settings.get("og_accent", "Blue"))
+    tm.attach(app)
     saved = settings.get("theme", "Dark")
-    if saved in ThemeManager.instance().theme_names():
-        ThemeManager.instance().set_theme(saved)
+    if saved in tm.theme_names():
+        tm.set_theme(saved)
 
     # Construct the main window up-front but keep it hidden. We show
     # the boot-sequence splash first, then hand off to the main window

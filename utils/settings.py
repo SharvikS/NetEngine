@@ -17,6 +17,8 @@ _SETTINGS_FILE = _SETTINGS_DIR / "settings.json"
 
 _DEFAULTS: dict[str, Any] = {
     "theme": "Dark",
+    "glass_opacity": 88,
+    "og_accent": "Blue",
     "ssh_hosts": [],          # list of {name, host, port, user, key_path}
     "last_interface": "",
     "last_port_preset": 0,

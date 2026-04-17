@@ -20,11 +20,11 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTextEdit, QLineEdit, QProgressBar, QFileDialog, QComboBox,
-    QMessageBox, QFormLayout, QGroupBox, QSpinBox, QTreeWidget,
-    QTreeWidgetItem, QSplitter, QFrame, QWidget,
+    QMessageBox, QFormLayout, QGroupBox, QSlider, QSpinBox,
+    QTreeWidget, QTreeWidgetItem, QSplitter, QFrame, QWidget,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap
 
 from scanner.host_scanner import HostInfo
 from scanner.port_scanner import scan_ports
@@ -837,12 +837,52 @@ class SettingsDialog(QDialog):
         form.addRow("Theme:", self._theme_combo)
 
         self._theme_hint = QLabel(
-            "Available: Dark (default), Neon, Space, Glass, "
-            "Light (WinSCP)."
+            "Dark (default), Neon, Space, Liquid Glass, "
+            "Light (WinSCP), OG Black, Retro Terminal."
         )
         self._theme_hint.setObjectName("lbl_subtitle")
         self._theme_hint.setWordWrap(True)
         form.addRow("", self._theme_hint)
+
+        # Liquid Glass transparency slider — only visible when that
+        # theme is active.
+        glass_row = QWidget()
+        gr = QHBoxLayout(glass_row)
+        gr.setContentsMargins(0, 0, 0, 0)
+        gr.setSpacing(10)
+        self._glass_slider = QSlider(Qt.Orientation.Horizontal)
+        self._glass_slider.setRange(60, 100)
+        self._glass_slider.setValue(
+            settings.get("glass_opacity", 88)
+        )
+        self._glass_slider.setTickInterval(5)
+        self._glass_slider.setMinimumWidth(180)
+        self._glass_slider.valueChanged.connect(self._on_glass_opacity)
+        gr.addWidget(self._glass_slider, 1)
+        self._glass_label = QLabel(f"{self._glass_slider.value()}%")
+        self._glass_label.setFixedWidth(38)
+        gr.addWidget(self._glass_label)
+        self._glass_row_label = QLabel("Background opacity:")
+        form.addRow(self._glass_row_label, glass_row)
+        self._glass_row = glass_row
+
+        # OG Black accent picker — coloured swatch icons in the dropdown.
+        from gui.themes import OG_BLACK_ACCENTS
+        self._accent_combo = QComboBox()
+        self._accent_combo.setMinimumWidth(140)
+        for name, (color, *_rest) in OG_BLACK_ACCENTS.items():
+            pm = QPixmap(14, 14)
+            pm.fill(QColor(color))
+            self._accent_combo.addItem(QIcon(pm), name)
+        saved_accent = settings.get("og_accent", "Blue")
+        idx = self._accent_combo.findText(saved_accent)
+        if idx >= 0:
+            self._accent_combo.setCurrentIndex(idx)
+        self._accent_combo.currentTextChanged.connect(self._on_og_accent)
+        self._accent_label = QLabel("Accent color:")
+        form.addRow(self._accent_label, self._accent_combo)
+
+        self._sync_theme_options()
 
         lay.addWidget(appearance)
 
@@ -928,6 +968,25 @@ class SettingsDialog(QDialog):
     def _on_theme_changed(self, name: str):
         ThemeManager.instance().set_theme(name)
         settings.set_value("theme", name)
+        self._sync_theme_options()
+
+    def _on_glass_opacity(self, value: int) -> None:
+        self._glass_label.setText(f"{value}%")
+        ThemeManager.instance().set_glass_opacity(value)
+        settings.set_value("glass_opacity", value)
+
+    def _on_og_accent(self, name: str) -> None:
+        ThemeManager.instance().set_og_accent(name)
+        settings.set_value("og_accent", name)
+
+    def _sync_theme_options(self) -> None:
+        cur = self._theme_combo.currentText()
+        is_glass = cur == "Liquid Glass"
+        is_og    = cur == "OG Black"
+        self._glass_row.setVisible(is_glass)
+        self._glass_row_label.setVisible(is_glass)
+        self._accent_combo.setVisible(is_og)
+        self._accent_label.setVisible(is_og)
 
     # ── Editor handlers ──────────────────────────────────────────────
 
