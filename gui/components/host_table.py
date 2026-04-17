@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
 
 from scanner.host_scanner import HostInfo
 from gui.themes import theme, ThemeManager
+from utils.clipboard import copy_text
 
 
 # ── Column definitions ────────────────────────────────────────────────────────
@@ -439,7 +440,7 @@ class HostTableWidget(QTableView):
             except Exception:
                 pass
         elif chosen == act_copy:
-            QApplication.clipboard().setText(host.ip)
+            copy_text(host.ip)
         elif chosen == act_resc:
             self.host_rescan.emit(host)
         elif chosen == act_port:

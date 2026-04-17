@@ -104,7 +104,10 @@ class ScpResult:
 # ── Engine ────────────────────────────────────────────────────────────────
 
 _CHUNK = 64 * 1024      # 64 KiB — matches OpenSSH's native chunk size
-_HEADER_TIMEOUT_S = 30  # max wall time to wait for a single control ack
+_HEADER_TIMEOUT_S = 30  # initial handshake timeout
+_BODY_TIMEOUT_S = 120   # per-recv timeout during body streaming — generous so
+                        # slow links and busy embedded devices don't get
+                        # killed mid-file
 
 
 class ScpTransferEngine:
@@ -222,7 +225,17 @@ class ScpTransferEngine:
             )
             try:
                 # Signal readiness so the remote starts streaming.
-                chan.sendall(b"\x00")
+                # Wrap in a try so a channel that died during exec
+                # (remote refused scp, transport wedged) surfaces a
+                # clean ScpError instead of a raw socket exception.
+                try:
+                    chan.sendall(b"\x00")
+                except Exception as exc:
+                    detail = _drain_stderr(chan)
+                    suffix = f": {detail}" if detail else ""
+                    raise ScpError(
+                        f"SCP handshake failed{suffix}: {exc}"
+                    ) from exc
                 files, dirs, total = self._receive_stream(
                     chan,
                     root_dir=local_dir,
@@ -232,7 +245,9 @@ class ScpTransferEngine:
                     cancel_flag=cancel_flag,
                 )
                 if files == 0:
-                    raise ScpError(f"Remote did not return a file: {remote_path}")
+                    raise ScpError(
+                        f"Remote did not return a file: {remote_path}"
+                    )
                 return ScpResult(files=files, directories=dirs, bytes_total=total)
             finally:
                 _close_channel(chan)
@@ -274,10 +289,230 @@ class ScpTransferEngine:
             finally:
                 _close_channel(chan)
 
+    # ── Shell-based read fallback (no scp / no sftp hosts) ────────────
+
+    def shell_read_file(
+        self,
+        remote_path: str,
+        local_dir: str,
+        *,
+        local_name: Optional[str] = None,
+        on_progress: Optional[ProgressCallback] = None,
+        cancel_flag: Optional[CancelFlag] = None,
+    ) -> ScpResult:
+        """
+        Shell-level fallback that streams a single remote file over a
+        plain exec_command channel. Used when real SCP fails (missing
+        remote scp binary, Dropbear scp quirks, permission wedges,
+        short reads, …) or on stripped embedded Linux userlands where
+        scp simply doesn't exist.
+
+        Protocol
+        --------
+        1. Probe the target with one portable POSIX shell snippet
+           that:
+             - classifies the path (MISSING / ISDIR / NOPERM / OK),
+             - resolves the exact byte count using ``wc -c`` with a
+               ``stat -c %s`` fallback (BSD ``stat -f %z`` as a final
+               tier), and
+             - emits a single ``OK:<size>`` token so the result is
+               trivial to parse regardless of BusyBox vs GNU
+               coreutils differences.
+        2. If the size is 0 we simply create an empty local file
+           (no cat channel, no streaming) — empty files are the
+           single most common reason to see "SCP read failed" on
+           hosts where the remote scp's empty-file handshake is
+           subtly broken.
+        3. Otherwise open a dedicated exec channel running
+           ``cat -- <path>`` with stderr kept separate (so error
+           text can't corrupt the binary stream) and read exactly
+           ``size`` bytes into the local target. Paramiko channels
+           are 8-bit clean so this is safe for binary files too.
+        4. After the body read, probe the channel's exit status if
+           it has already terminated; surface any stderr text that
+           leaked through.
+
+        BusyBox / OpenWrt compatibility
+        -------------------------------
+        Every command used here ships in BusyBox's base build:
+        ``[``, ``test``, ``printf``, ``wc``, ``cat``. ``stat`` is
+        optional — it's only consulted as a fallback when ``wc``
+        returns nothing. POSIX ``sh`` quoting is done in Python via
+        ``shlex.quote``, so filenames with spaces, dollars, quotes,
+        newlines, or leading dashes round-trip safely.
+        """
+        if not remote_path:
+            raise ScpError("Remote path is required")
+        os.makedirs(local_dir, exist_ok=True)
+
+        session = self._session
+        if session is None or not getattr(session, "is_open", False):
+            raise ScpError("SSH session is not connected")
+        exec_fn = getattr(session, "exec_command", None)
+        if not callable(exec_fn):
+            raise ScpError("SSH session does not support exec_command")
+
+        quoted = _quote(remote_path)
+        # Portable one-shot probe. ``p`` holds the path so the tests
+        # don't repeat the long shlex-quoted literal. ``printf`` is
+        # used instead of ``echo`` because BusyBox / dash / ash have
+        # historically disagreed on whether ``echo -n`` is a thing.
+        # The trailing newline after the OK token is intentional so
+        # Python can match on a line boundary reliably.
+        probe_cmd = (
+            f'p={quoted}; '
+            f'if [ ! -e "$p" ]; then printf "MISSING\\n"; exit 0; fi; '
+            f'if [ -d "$p" ]; then printf "ISDIR\\n"; exit 0; fi; '
+            f'if [ ! -r "$p" ]; then printf "NOPERM\\n"; exit 0; fi; '
+            f'sz=$(wc -c < "$p" 2>/dev/null | tr -d " \\t\\r\\n"); '
+            f'[ -z "$sz" ] && sz=$(stat -c %s "$p" 2>/dev/null); '
+            f'[ -z "$sz" ] && sz=$(stat -f %z "$p" 2>/dev/null); '
+            f'[ -z "$sz" ] && sz=-1; '
+            f'printf "OK:%s\\n" "$sz"'
+        )
+        try:
+            rc, out, err = exec_fn(probe_cmd, timeout=30.0)
+        except Exception as exc:
+            raise ScpError(f"Shell probe failed: {exc}") from exc
+
+        head = (out or "").strip().splitlines()[0].strip() if out else ""
+        if head == "MISSING":
+            raise ScpError(f"Remote file not found: {remote_path}")
+        if head == "ISDIR":
+            raise ScpError(f"Remote path is a directory: {remote_path}")
+        if head == "NOPERM":
+            raise ScpError(f"Permission denied: {remote_path}")
+        if not head.startswith("OK:"):
+            detail = (err or out or "").strip() or f"exit {rc}"
+            detail = " ".join(detail.split())[:300]
+            raise ScpError(f"Shell probe unexpected output: {detail}")
+        try:
+            size = int(head[3:].strip())
+        except ValueError:
+            size = -1
+        if size < 0:
+            raise ScpError(
+                f"Could not determine remote file size: {remote_path}"
+            )
+
+        name = local_name or os.path.basename(remote_path) or "file"
+        local_path = os.path.join(local_dir, name)
+        parent = os.path.dirname(local_path) or "."
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            raise ScpError(f"{parent}: {exc}") from exc
+
+        # Empty file → materialise an empty local file and return.
+        # Never opens a cat channel at all — this is the fast path
+        # for ``.viminfo`` and similar dotfiles that OpenWrt devices
+        # often ship as zero bytes.
+        if size == 0:
+            try:
+                open(local_path, "wb").close()
+            except OSError as exc:
+                raise ScpError(f"{local_path}: {exc}") from exc
+            _invoke_progress(on_progress, 0, 0, name)
+            return ScpResult(files=1, directories=0, bytes_total=0)
+
+        # Stream the body through a dedicated cat channel. stderr is
+        # kept separate so error text from ``cat`` cannot bleed into
+        # the binary payload we're writing to disk.
+        with self._lock:
+            chan = self._open_channel(
+                f"cat -- {quoted}",
+                combine_stderr=False,
+            )
+            try:
+                try:
+                    chan.settimeout(_BODY_TIMEOUT_S)
+                except Exception:
+                    pass
+                try:
+                    fh = open(local_path, "wb")
+                except OSError as exc:
+                    raise ScpError(f"{local_path}: {exc}") from exc
+
+                received = 0
+                try:
+                    _invoke_progress(on_progress, 0, size, name)
+                    while received < size:
+                        if _is_cancelled(cancel_flag):
+                            raise ScpCancelled(f"Transfer cancelled: {name}")
+                        remaining = size - received
+                        want = remaining if remaining < _CHUNK else _CHUNK
+                        try:
+                            chunk = chan.recv(want)
+                        except Exception as exc:
+                            detail = _drain_stderr(chan)
+                            suffix = f" — {detail}" if detail else ""
+                            raise ScpError(
+                                f"Shell read failed{suffix}: {exc}"
+                            ) from exc
+                        if not chunk:
+                            # Short read — either the file was
+                            # truncated under us or cat exited early.
+                            # Prefer any stderr text the remote
+                            # already wrote; fall back to a generic
+                            # short-read error.
+                            detail = _drain_stderr(chan)
+                            if detail:
+                                raise ScpError(
+                                    f"Shell read: {detail}"
+                                )
+                            raise ScpError(
+                                f"Remote closed channel mid-file: "
+                                f"{name} ({received}/{size} bytes)"
+                            )
+                        fh.write(chunk)
+                        received += len(chunk)
+                        _invoke_progress(on_progress, received, size, name)
+                finally:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+
+                # Exit-status sanity check. ``cat`` on BusyBox / GNU
+                # coreutils exits 0 on full-file reads, so anything
+                # else is a warning sign. ``exit_status_ready()`` is
+                # non-blocking — if cat hasn't yet reaped we accept
+                # the successful body read as-is rather than stall.
+                try:
+                    if chan.exit_status_ready():
+                        exit_code = chan.recv_exit_status()
+                        if exit_code not in (0, -1):
+                            detail = _drain_stderr(chan)
+                            suffix = f": {detail}" if detail else ""
+                            raise ScpError(
+                                f"Remote cat exited with status "
+                                f"{exit_code}{suffix}"
+                            )
+                except ScpError:
+                    raise
+                except Exception:
+                    pass
+
+                return ScpResult(files=1, directories=0, bytes_total=size)
+            finally:
+                _close_channel(chan)
+
     # ── Internal: channel setup ────────────────────────────────────────
 
-    def _open_channel(self, command: str):
-        """Open a fresh paramiko channel running ``command`` on the remote."""
+    def _open_channel(self, command: str, *, combine_stderr: bool = True):
+        """
+        Open a fresh paramiko channel running ``command`` on the remote.
+
+        ``combine_stderr`` defaults to True for SCP flows: otherwise, any
+        error that the remote ``scp`` binary writes to stderr (missing
+        file, permission denied, ``scp: command not found`` on stripped
+        embedded builds) never reaches ``recv()`` on stdout and the
+        caller hangs until ``_HEADER_TIMEOUT_S`` fires with a cryptic
+        "SCP read failed: timed out". Merging stderr in is safe because
+        OpenSSH's scp never writes normal protocol traffic to stderr —
+        either we see a clean protocol stream, or we see the remote's
+        error text directly and can surface it.
+        """
         if not HAS_PARAMIKO:
             raise ScpError("paramiko is not installed")
         session = self._session
@@ -297,6 +532,11 @@ class ScpTransferEngine:
         except Exception as exc:
             raise ScpError(f"Could not open SSH channel: {exc}") from exc
         try:
+            if combine_stderr:
+                try:
+                    chan.set_combine_stderr(True)
+                except Exception:
+                    pass
             chan.settimeout(_HEADER_TIMEOUT_S)
             chan.exec_command(command)
         except Exception as exc:
@@ -501,10 +741,27 @@ class ScpTransferEngine:
                 chan.sendall(b"\x00")
                 continue
 
-            # Error / warning messages from the remote: 0x01 / 0x02
-            # byte prefixes. Our _read_control_line already translates
-            # those to ScpError, so reaching here means an unexpected
-            # control byte.
+            # Anything else is either a raw shell error that leaked
+            # onto stdout (combined stderr) or a protocol desync.
+            # Common examples on BusyBox / Dropbear hosts:
+            #
+            #   ``sh: scp: not found``
+            #   ``scp: /etc/shadow: Permission denied``
+            #   ``ash: line 1: scp: command not found``
+            #
+            # Surface the full line verbatim so callers can classify
+            # it and the UI can translate it into a clean headline.
+            stripped = line.strip()
+            lower = stripped.lower()
+            if any(token in lower for token in (
+                "not found",
+                "no such file",
+                "permission denied",
+                "command not found",
+                "scp:",
+                "error",
+            )):
+                raise ScpError(f"SCP remote: {stripped}")
             raise ScpError(f"Unexpected SCP control message: {line!r}")
 
         return files, dirs, total
@@ -531,6 +788,16 @@ class ScpTransferEngine:
         except OSError as exc:
             raise ScpError(f"{local_path}: {exc}") from exc
 
+        # Body reads get a more generous per-recv timeout than the
+        # header handshake — a slow embedded device can stall for
+        # several seconds between chunks on a large file, and the
+        # default 30 s is too tight. Restored by the caller when the
+        # channel closes.
+        try:
+            chan.settimeout(_BODY_TIMEOUT_S)
+        except Exception:
+            pass
+
         received = 0
         try:
             while received < size:
@@ -541,7 +808,10 @@ class ScpTransferEngine:
                 try:
                     chunk = chan.recv(want)
                 except Exception as exc:
-                    raise ScpError(f"Channel read failed: {exc}") from exc
+                    raise ScpError(
+                        f"Channel read failed while receiving {name} "
+                        f"({received}/{size} bytes): {exc}"
+                    ) from exc
                 if not chunk:
                     raise ScpError(
                         f"Remote closed channel mid-file: {name} "
@@ -556,6 +826,10 @@ class ScpTransferEngine:
         finally:
             try:
                 fh.close()
+            except Exception:
+                pass
+            try:
+                chan.settimeout(_HEADER_TIMEOUT_S)
             except Exception:
                 pass
 
@@ -573,8 +847,14 @@ class ScpTransferEngine:
         try:
             byte = chan.recv(1)
         except Exception as exc:
+            detail = _drain_stderr(chan)
+            if detail:
+                raise ScpError(f"SCP remote: {detail}") from exc
             raise ScpError(f"SCP ack read failed: {exc}") from exc
         if not byte:
+            detail = _drain_stderr(chan)
+            if detail:
+                raise ScpError(f"SCP remote: {detail}")
             raise ScpError("SCP: remote closed channel before acknowledgement")
         code = byte[0]
         if code == 0:
@@ -593,17 +873,42 @@ class ScpTransferEngine:
         Read one control message starting with its kind byte. Returns
         None on clean EOF, or the decoded line without the trailing
         newline on success. 0x01/0x02 warn/error bytes raise ScpError.
+
+        On a timeout or socket error we also try to drain any pending
+        stderr (in case the caller opened the channel with stderr kept
+        separate) so the caller sees the actual remote error text
+        instead of a bare "timed out".
         """
         try:
             first = chan.recv(1)
         except Exception as exc:
+            detail = _drain_stderr(chan)
+            if detail:
+                raise ScpError(f"SCP remote: {detail}") from exc
             raise ScpError(f"SCP read failed: {exc}") from exc
         if not first:
+            # Clean EOF on stdout. If the remote closed without ever
+            # sending a protocol byte, its error (if any) is probably
+            # sitting in stderr — surface that instead of silently
+            # returning None.
+            detail = _drain_stderr(chan)
+            if detail:
+                raise ScpError(f"SCP remote: {detail}")
             return None
         code = first[0]
         if code in (1, 2):
             message = _read_line(chan).decode("utf-8", errors="replace").strip()
             raise ScpError(f"SCP remote: {message or 'error'}")
+        # Control messages are printable ASCII (T / C / D / E). Anything
+        # else usually means we got raw shell output — e.g. the remote
+        # has no scp binary and the shell printed "scp: not found" on
+        # stdout. Slurp the rest of the line and surface it as an error
+        # rather than returning a malformed control line.
+        if not (0x20 <= code <= 0x7e):
+            raise ScpError(
+                f"SCP: unexpected byte 0x{code:02x} from remote "
+                f"(scp may not be installed on the remote host)"
+            )
         rest = _read_line(chan)
         return chr(code) + rest.decode("utf-8", errors="replace").rstrip("\n")
 
@@ -624,6 +929,45 @@ def _read_line(chan) -> bytes:
             break
         out.extend(b)
     return bytes(out)
+
+
+def _drain_stderr(chan) -> str:
+    """
+    Best-effort drain of a paramiko channel's stderr buffer. Used when
+    an SCP read fails so we can surface any error text the remote has
+    already emitted on stderr (e.g. ``sh: scp: not found``, ``scp: open
+    /etc/shadow: Permission denied``). Returns a short trimmed string
+    or ``""`` if nothing is available. Must not block — uses the
+    non-blocking ``recv_stderr_ready`` probe.
+    """
+    if chan is None:
+        return ""
+    out = bytearray()
+    try:
+        ready = getattr(chan, "recv_stderr_ready", None)
+        recv = getattr(chan, "recv_stderr", None)
+        if not callable(ready) or not callable(recv):
+            return ""
+        deadline = time.monotonic() + 0.5  # bounded wait — don't stall the error path
+        while time.monotonic() < deadline:
+            if not ready():
+                break
+            try:
+                buf = recv(4096)
+            except Exception:
+                break
+            if not buf:
+                break
+            out.extend(buf)
+            if len(out) >= 4096:
+                break
+    except Exception:
+        return ""
+    text = bytes(out).decode("utf-8", errors="replace").strip()
+    # Collapse multi-line noise onto one line for the UI.
+    if text:
+        text = " ".join(text.split())
+    return text[:400]
 
 
 def _parse_entry_header(line: str) -> tuple[int, int, str]:

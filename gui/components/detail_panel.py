@@ -36,6 +36,7 @@ from PyQt6.QtGui import QFont
 from scanner.host_scanner import HostInfo
 from scanner.service_mapper import describe_ports
 from gui.themes import theme, ThemeManager
+from utils.clipboard import copy_text
 
 
 # ── Tiny info field (label / value pair) ─────────────────────────────────────
@@ -589,9 +590,9 @@ class DetailPanel(QFrame):
     def _do_copy_ip(self) -> None:
         if not self._current_host:
             return
+        ok = copy_text(self._current_host.ip)
         try:
-            QApplication.clipboard().setText(self._current_host.ip)
-            self._btn_copy_ip.setText("Copied")
+            self._btn_copy_ip.setText("Copied" if ok else "Copy failed")
         except RuntimeError:
             return
         QTimer.singleShot(1500, self._clear_copy_ip_label)

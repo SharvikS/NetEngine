@@ -173,6 +173,42 @@ def s_csi_2j():
     assert w.toPlainText() == "", repr(w.toPlainText())
 
 
+@scenario("BusyBox clear: H + J (mode 0) wipes the whole document")
+def s_busybox_clear():
+    # BusyBox / minimal ``clear`` sends CUP-home followed by
+    # erase-in-display mode 0. Real terminals treat this as a
+    # full-screen clear because the cursor is parked at (1,1).
+    # Our linear-document emulator has to recognise the H→J
+    # pair explicitly — otherwise mode 0 would only erase the
+    # single line the cursor is sitting on.
+    w = new_widget()
+    feed(w, b"line1\r\nline2\r\nuser@box:~$ ls\r\na  b  c\r\nuser@box:~$ ")
+    feed(w, b"\x1b[H\x1b[J")
+    assert w.toPlainText() == "", repr(w.toPlainText())
+
+
+@scenario("Ctrl+L redraw: H + 2J + prompt lands at the top")
+def s_ctrl_l_redraw():
+    w = new_widget()
+    feed(w, b"scrollback\r\nmore\r\nuser@box:~$ ")
+    feed(w, b"\x1b[H\x1b[2J")
+    feed(w, b"user@box:~$ ")
+    assert w.toPlainText() == "user@box:~$ ", repr(w.toPlainText())
+
+
+@scenario("Non-home CUP + J erases only to end (not full screen)")
+def s_csi_j_mid_stream():
+    # An erase-to-end that isn't preceded by a home-cursor must
+    # behave as the plain ``\x1b[J`` spec says: erase from the
+    # cursor to the end of the document. This guards against the
+    # home-pending latch leaking into mid-stream uses of J.
+    w = new_widget()
+    feed(w, b"keep me\r\ndrop me\r\nalso drop")
+    # Move cursor up to the middle of the second line, then J.
+    feed(w, b"\x1b[2A\r\x1b[4C\x1b[J")
+    assert w.toPlainText() == "keep", repr(w.toPlainText())
+
+
 @scenario("cursor movement CSI A/B/C/D")
 def s_cursor_arrows():
     w = new_widget()
