@@ -25,7 +25,10 @@ sending to a dead channel, or racing with a background reader.
 
 from __future__ import annotations
 
+import logging
+import os
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -37,6 +40,124 @@ try:
 except ImportError:                                          # pragma: no cover
     paramiko = None
     HAS_PARAMIKO = False
+
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+#
+# All SSH lifecycle events go through ``logger`` so the user (or a
+# support engineer chasing a connection issue) can flip a single env
+# var and see exactly what happened: connection attempt, auth method
+# selected, socket connect, banner exchange, channel creation, every
+# disconnect reason.
+#
+# The logger is silent by default (no handler beyond NullHandler) so
+# we never spam stdout in normal operation. Set ``NETENGINE_SSH_DEBUG=1``
+# in the environment to enable a console handler at DEBUG level. The
+# value is read once at import time; flipping it later requires a
+# restart, which keeps the logging state predictable.
+
+logger = logging.getLogger("netengine.ssh")
+logger.addHandler(logging.NullHandler())
+
+
+def _enable_console_logging_if_requested() -> None:
+    """
+    Attach a console handler to ``logger`` if the user has asked for
+    SSH debug output via the ``NETENGINE_SSH_DEBUG`` environment
+    variable. Called once at module load. Safe to call repeatedly —
+    the handler-add is guarded against duplicates.
+    """
+    if os.environ.get("NETENGINE_SSH_DEBUG", "").strip() not in ("1", "true", "yes", "on"):
+        return
+    # Avoid stacking handlers on every import (unlikely but cheap to guard).
+    for h in logger.handlers:
+        if getattr(h, "_netengine_ssh_console", False):
+            return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-7s  ssh: %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    handler._netengine_ssh_console = True  # type: ignore[attr-defined]
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    # paramiko's own logger is noisy at DEBUG but extremely useful when
+    # diagnosing handshake / kex / auth failures — chain it on too.
+    pk_logger = logging.getLogger("paramiko")
+    pk_logger.setLevel(logging.DEBUG)
+    pk_logger.addHandler(handler)
+
+
+_enable_console_logging_if_requested()
+
+
+# ── Friendly error translation ──────────────────────────────────────────────
+#
+# paramiko surfaces auth/network errors with messages aimed at
+# developers ("Authentication failed.", "[Errno 11001] getaddrinfo
+# failed", "timed out"). The GUI prints those as-is which doesn't help
+# a user figure out *what to fix*. ``friendly_error`` maps the most
+# common exception types to a short, plain-English summary plus a
+# hint line so the terminal-banner failure block reads like a real
+# SSH client's error message.
+
+def friendly_error(exc: BaseException) -> str:
+    """
+    Translate an SSH connect/start exception into a one-or-two-line
+    user-facing message.
+
+    Always returns a non-empty string. Includes the original error
+    text when it adds detail (auth back-ends, transport reason
+    strings) so a power user can still diagnose without enabling
+    debug logging.
+    """
+    raw = (str(exc) or type(exc).__name__).strip()
+
+    if HAS_PARAMIKO:
+        if isinstance(exc, paramiko.AuthenticationException):
+            return (
+                "Authentication failed — check the username and password "
+                "(or private key path)."
+            )
+        if isinstance(exc, paramiko.BadHostKeyException):
+            return (
+                "Host key verification failed — the remote host key has "
+                "changed. If this is expected, remove the old key from "
+                "your known_hosts file."
+            )
+        if isinstance(exc, paramiko.ChannelException):
+            return f"SSH channel error: {raw}"
+        if isinstance(exc, paramiko.SSHException):
+            low = raw.lower()
+            if "banner" in low:
+                return (
+                    "No SSH banner from server — the host answered but did "
+                    "not speak SSH. Verify the port and that an SSH daemon "
+                    "is listening."
+                )
+            if "no existing session" in low:
+                return (
+                    "Could not open an SSH session — the remote refused or "
+                    "tore down the connection."
+                )
+            return f"SSH error: {raw}"
+
+    if isinstance(exc, socket.timeout):
+        return (
+            "Connection timed out — the host did not answer in time. "
+            "Check the IP/host, port, and that the device is reachable."
+        )
+    if isinstance(exc, ConnectionRefusedError):
+        return (
+            "Connection refused — nothing is listening on this port, or a "
+            "firewall is blocking it."
+        )
+    if isinstance(exc, socket.gaierror):
+        return f"Could not resolve host — {raw}"
+    if isinstance(exc, OSError):
+        # Generic network failures: unreachable, network down, etc.
+        return f"Network error: {raw}"
+    return raw
 
 
 # ── Connection profile ───────────────────────────────────────────────────────
@@ -121,6 +242,10 @@ class SSHSession:
         if not profile.host or not profile.user:
             raise ValueError("Host and user are required.")
 
+        port = int(profile.port or 22)
+        if port < 1 or port > 65535:
+            raise ValueError(f"Port must be in 1..65535, got {profile.port!r}.")
+
         # Don't allow reusing a session object for a second connection —
         # the old transport could still be holding sockets.
         with self._lock:
@@ -129,12 +254,25 @@ class SSHSession:
             if self._closed:
                 raise RuntimeError("SSHSession has been closed; create a new one.")
 
+        # Pick the auth method we'll *try first*, for the log line.
+        # paramiko itself walks the methods the server advertises; we
+        # just record which credential the user supplied.
+        auth_method = (
+            "key" if profile.key_path
+            else "password" if profile.password
+            else "agent/key-discovery"
+        )
+        logger.info(
+            "connect attempt host=%s port=%d user=%s auth=%s timeout=%.1fs",
+            profile.host, port, profile.user, auth_method, timeout,
+        )
+
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         kwargs = dict(
             hostname=profile.host,
-            port=int(profile.port or 22),
+            port=port,
             username=profile.user,
             timeout=timeout,
             banner_timeout=timeout,
@@ -148,8 +286,13 @@ class SSHSession:
             kwargs["key_filename"] = profile.key_path
 
         chan = None
+        t0 = time.monotonic()
         try:
             client.connect(**kwargs)
+            logger.info(
+                "transport up host=%s after %.2fs — opening shell channel",
+                profile.host, time.monotonic() - t0,
+            )
             # ``xterm`` is the safest TERM value for BusyBox/OpenWrt:
             # its terminfo entry is tiny but universally installed,
             # whereas ``xterm-256color`` may be missing from a stock
@@ -163,7 +306,14 @@ class SSHSession:
             # shell never prints its first prompt at this size.
             chan = client.invoke_shell(term="xterm", width=100, height=32)
             chan.settimeout(0.0)   # non-blocking reads
-        except Exception:
+            logger.info("shell channel ready host=%s", profile.host)
+        except Exception as exc:
+            logger.warning(
+                "connect failed host=%s port=%d user=%s after %.2fs — %s: %s",
+                profile.host, port, profile.user,
+                time.monotonic() - t0,
+                type(exc).__name__, exc,
+            )
             # Clean up the half-open client so a failed connect does
             # not leak a socket / transport thread.
             try:
@@ -181,6 +331,10 @@ class SSHSession:
             if self._closed:
                 # Someone called close() while we were connecting —
                 # honour that and tear the fresh channel back down.
+                logger.info(
+                    "session closed during start() host=%s — tearing fresh channel down",
+                    profile.host,
+                )
                 try:
                     chan.close()
                 except Exception:
@@ -244,22 +398,28 @@ class SSHSession:
         caller should treat it as "runs until the session ends".
         """
         chan = self._channel
+        reason = "stopped"
         try:
             if chan is None:
+                logger.debug("read_loop: no channel attached, exiting")
                 return
+            logger.debug("read_loop: starting")
             while not self._stop.is_set():
                 # Bail immediately if the channel was torn down from
                 # another thread. Accessing `.closed` can raise if the
                 # transport is mid-teardown, so guard it.
                 try:
                     if chan.closed:
+                        reason = "channel closed"
                         break
                 except Exception:
+                    reason = "channel attribute error"
                     break
 
                 try:
                     ready = chan.recv_ready()
                 except Exception:
+                    reason = "recv_ready error"
                     break
 
                 if ready:
@@ -268,10 +428,12 @@ class SSHSession:
                     except socket.timeout:
                         # Non-blocking recv race — just loop.
                         continue
-                    except Exception:
+                    except Exception as exc:
+                        reason = f"recv error ({type(exc).__name__})"
                         break
                     if not data:
                         # EOF on the channel.
+                        reason = "remote EOF"
                         break
                     try:
                         callback(data)
@@ -289,8 +451,10 @@ class SSHSession:
                 try:
                     exit_ready = chan.exit_status_ready()
                 except Exception:
+                    reason = "transport torn down"
                     break
                 if exit_ready:
+                    reason = "remote exit"
                     # Drain anything still buffered.
                     try:
                         while not self._stop.is_set() and chan.recv_ready():
@@ -309,12 +473,14 @@ class SSHSession:
                 # unblocks us immediately instead of waiting out the
                 # remainder of the 30ms tick.
                 if self._stop.wait(0.03):
+                    reason = "stop event"
                     break
-        except Exception:
+        except Exception as exc:
             # Catch-all: anything paramiko throws at us translates to a
             # clean end-of-loop.
-            pass
+            reason = f"unexpected error ({type(exc).__name__})"
         finally:
+            logger.info("read_loop ended — reason=%s", reason)
             if on_close is not None:
                 try:
                     on_close()
@@ -445,6 +611,7 @@ class SSHSession:
             self._channel = None
             self._client = None
 
+        had_chan = chan is not None
         # Release the lock before touching paramiko so a slow transport
         # teardown can't deadlock a concurrent is_open() check from the
         # GUI thread.
@@ -458,3 +625,5 @@ class SSHSession:
                 client.close()
         except Exception:
             pass
+        if had_chan:
+            logger.info("session closed — channel + client torn down")

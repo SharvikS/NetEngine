@@ -17,7 +17,10 @@ _SETTINGS_FILE = _SETTINGS_DIR / "settings.json"
 
 _DEFAULTS: dict[str, Any] = {
     "theme": "Dark",
+    "glass_opacity": 88,
+    "og_accent": "Blue",
     "ssh_hosts": [],          # list of {name, host, port, user, key_path}
+    "serial_hosts": [],       # list of saved Serial/UART profile dicts
     "last_interface": "",
     "last_port_preset": 0,
     "terminal_shell": "",     # PowerShell / CMD / WSL / Bash
@@ -33,7 +36,25 @@ _DEFAULTS: dict[str, Any] = {
     # File Transfer → local pane collapse state. Persisted so the
     # user's last choice survives app restarts.
     "file_transfer_local_collapsed": False,
+    # About page — index of the last tagline shown. Lets the rotating
+    # line advance across restarts instead of always starting at 0.
+    "about_tagline_index": -1,
 }
+
+
+def settings_file_path() -> str:
+    """Absolute path to the on-disk settings file."""
+    return str(_SETTINGS_FILE)
+
+
+def settings_dir_path() -> str:
+    """Absolute path to the settings directory (~/.netscope)."""
+    return str(_SETTINGS_DIR)
+
+
+def reset_all() -> None:
+    """Overwrite the settings file with built-in defaults."""
+    _save(dict(_DEFAULTS))
 
 
 def _load() -> dict:
@@ -85,6 +106,34 @@ def save_ssh_host(entry: dict) -> None:
 def delete_ssh_host(name: str) -> None:
     hosts = [h for h in get_ssh_hosts() if h.get("name") != name]
     set_value("ssh_hosts", hosts)
+
+
+# ── Serial / UART hosts ──────────────────────────────────────────────────────
+
+
+def get_serial_hosts() -> list[dict]:
+    return list(get("serial_hosts", []))
+
+
+def save_serial_host(entry: dict) -> None:
+    """Add or replace a saved Serial/UART profile by name."""
+    hosts = get_serial_hosts()
+    name = (entry.get("name") or "").strip()
+    if not name:
+        return
+    # Always tag the kind so generic loaders can route the entry.
+    entry = dict(entry)
+    entry["kind"] = "serial"
+    entry["name"] = name
+    hosts = [h for h in hosts if h.get("name") != name]
+    hosts.append(entry)
+    hosts.sort(key=lambda h: h.get("name", "").lower())
+    set_value("serial_hosts", hosts)
+
+
+def delete_serial_host(name: str) -> None:
+    hosts = [h for h in get_serial_hosts() if h.get("name") != name]
+    set_value("serial_hosts", hosts)
 
 
 # ── IP profiles (network adapter presets) ────────────────────────────────────

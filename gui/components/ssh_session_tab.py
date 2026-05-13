@@ -1,13 +1,21 @@
 """
-Single SSH session tab.
+Single connection tab (SSH or Serial/UART).
 
 Each tab is a self-contained mini-workspace:
 
   * a header strip with status dot, friendly title, the
-    `user@host:port` summary, an inline status label and per-session
-    Reconnect / Disconnect buttons
-  * an embedded `TerminalWidget` bound to a paramiko `SSHSession`
-    that runs on a daemon worker thread
+    `user@host:port` (SSH) or `COM3 @ 115200 8N1` (Serial) summary,
+    an inline status label and per-session Reconnect / Disconnect
+    buttons
+  * an embedded `TerminalWidget` bound to either a paramiko
+    `SSHSession` or a pyserial-backed `SerialSession`, both of which
+    expose the same ``is_open / send / read_loop / resize / close``
+    surface so the terminal widget can drive either transport
+    identically
+
+The class is named ``SshSessionTab`` for backwards-compatibility but
+it is the single tab type for both connection kinds — the profile it
+is constructed with chooses the backend.
 
 Tabs are independent — closing or reconnecting one never touches the
 others, and each tab keeps its own command history (via the underlying
@@ -54,7 +62,12 @@ from PyQt6.QtWidgets import (
 from gui.components.terminal_widget import TerminalWidget
 from gui.components.live_widgets import StatusDot
 from gui.themes import theme, ThemeManager
-from scanner.ssh_client import SSHProfile, SSHSession, HAS_PARAMIKO
+from scanner.ssh_client import (
+    SSHProfile, SSHSession, HAS_PARAMIKO, friendly_error,
+)
+from scanner.serial_client import (
+    SerialProfile, SerialSession, HAS_PYSERIAL,
+)
 
 
 # State machine for one tab — drives the header strip and the parent
@@ -69,7 +82,14 @@ STATE_DESTROYED   = "destroyed"
 
 
 class SshSessionTab(QWidget):
-    """A single SSH session shown as a tab in the SSH workspace."""
+    """
+    A single connection tab — SSH or Serial — shown in the workspace.
+
+    Construct with either an :class:`SSHProfile` or a
+    :class:`SerialProfile`. The tab inspects the profile type and
+    routes to the appropriate backend; everything else (state machine,
+    UI scaffolding, terminal bridge) is shared.
+    """
 
     # Outward signals — the parent SSH view listens to these to update
     # the QTabWidget tab title, color and any per-tab status badge.
@@ -79,15 +99,21 @@ class SshSessionTab(QWidget):
     closed          = pyqtSignal()               # session is fully torn down
 
     # Internal cross-thread bridges. Each carries the connect token so
-    # the GUI thread can discard stale worker results.
+    # the GUI thread can discard stale worker results. Session payload
+    # is typed as object because it can be either an SSHSession or a
+    # SerialSession.
     _connect_failed_sig    = pyqtSignal(int, str)
-    _connect_succeeded_sig = pyqtSignal(int, object)  # token, SSHSession instance
+    _connect_succeeded_sig = pyqtSignal(int, object)  # token, session instance
 
-    def __init__(self, profile: SSHProfile, parent=None):
+    def __init__(self, profile, parent=None):
         super().__init__(parent)
         self.profile = profile
+        # Cache the profile kind once at construction. Both profile
+        # types carry an explicit ``kind`` attribute on SerialProfile;
+        # SSHProfile does not, so we default unknowns to "ssh".
+        self._is_serial: bool = isinstance(profile, SerialProfile)
         self._state = STATE_IDLE
-        self._session: Optional[SSHSession] = None
+        self._session = None
         self._worker: Optional[threading.Thread] = None
         self._opened_at: Optional[datetime] = None
 
@@ -183,11 +209,15 @@ class SshSessionTab(QWidget):
     def title_text(self) -> str:
         if self.profile.name:
             return self.profile.name
+        if self._is_serial:
+            return f"{self.profile.port or 'serial'} @ {self.profile.baud}"
         if self.profile.user and self.profile.host:
             return f"{self.profile.user}@{self.profile.host}"
         return self.profile.host or "session"
 
     def summary_text(self) -> str:
+        if self._is_serial:
+            return self.profile.summary()
         bits = []
         if self.profile.user:
             bits.append(self.profile.user + "@")
@@ -195,6 +225,12 @@ class SshSessionTab(QWidget):
         if self.profile.port and int(self.profile.port) != 22:
             bits.append(":" + str(self.profile.port))
         return "".join(bits)
+
+    def _log_target(self) -> str:
+        """Short ``user@host`` (SSH) or ``COM3`` (Serial) used in log lines."""
+        if self._is_serial:
+            return self.profile.port or "serial"
+        return f"{self.profile.user}@{self.profile.host}"
 
     def state(self) -> str:
         return self._state
@@ -259,16 +295,34 @@ class SshSessionTab(QWidget):
         if self._destroyed:
             return
 
-        if not HAS_PARAMIKO:
-            self._set_state(STATE_FAILED, "paramiko not installed — pip install paramiko")
-            try:
-                self.terminal._append(
-                    "[paramiko is not installed — SSH unavailable. "
-                    "Run: pip install paramiko]\n"
+        if self._is_serial:
+            if not HAS_PYSERIAL:
+                self._set_state(
+                    STATE_FAILED,
+                    "pyserial not installed — pip install pyserial",
                 )
-            except Exception:
-                pass
-            return
+                try:
+                    self.terminal._append(
+                        "[pyserial is not installed — Serial unavailable. "
+                        "Run: pip install pyserial]\n"
+                    )
+                except Exception:
+                    pass
+                return
+        else:
+            if not HAS_PARAMIKO:
+                self._set_state(
+                    STATE_FAILED,
+                    "paramiko not installed — pip install paramiko",
+                )
+                try:
+                    self.terminal._append(
+                        "[paramiko is not installed — SSH unavailable. "
+                        "Run: pip install paramiko]\n"
+                    )
+                except Exception:
+                    pass
+                return
 
         # Disallow starting a new connect while one is already in
         # progress or already connected. Reconnect goes through
@@ -284,10 +338,16 @@ class SshSessionTab(QWidget):
         try:
             self.terminal.detach_ssh(silent=True)
             self.terminal.clear()
-            self.terminal._append(
-                f"[connecting to {self.profile.user or '?'}@"
-                f"{self.profile.host}:{self.profile.port}…]\n"
-            )
+            if self._is_serial:
+                self.terminal._append(
+                    f"[opening {self.profile.port or '?'} @ "
+                    f"{self.profile.baud}…]\n"
+                )
+            else:
+                self.terminal._append(
+                    f"[connecting to {self.profile.user or '?'}@"
+                    f"{self.profile.host}:{self.profile.port}…]\n"
+                )
         except Exception:
             pass
 
@@ -302,11 +362,15 @@ class SshSessionTab(QWidget):
         token = self._connect_token
 
         self._session = None
+        if self._is_serial:
+            worker_name = f"serial-open-{self.profile.port}-{token}"
+        else:
+            worker_name = f"ssh-connect-{self.profile.host}-{token}"
         worker = threading.Thread(
             target=self._connect_worker,
             args=(self.profile, token),
             daemon=True,
-            name=f"ssh-connect-{self.profile.host}-{token}",
+            name=worker_name,
         )
         self._worker = worker
         worker.start()
@@ -394,9 +458,7 @@ class SshSessionTab(QWidget):
                 self._btn_disconnect.setEnabled(False)
             except Exception:
                 pass
-            self.log_appended.emit(
-                f"CANCELLED  {self.profile.user}@{self.profile.host}"
-            )
+            self.log_appended.emit(f"CANCELLED  {self._log_target()}")
             return
 
         # Silent cancel-during-connect (reconnect/shutdown): don't
@@ -529,10 +591,15 @@ class SshSessionTab(QWidget):
 
     # ── Worker plumbing ──────────────────────────────────────────────────────
 
-    def _connect_worker(self, profile: SSHProfile, token: int) -> None:
-        session = SSHSession()
+    def _connect_worker(self, profile, token: int) -> None:
+        if isinstance(profile, SerialProfile):
+            session = SerialSession()
+            timeout = 5.0
+        else:
+            session = SSHSession()
+            timeout = 8.0
         try:
-            session.start(profile, timeout=8.0)
+            session.start(profile, timeout=timeout)
         except Exception as exc:
             # Clean up the half-built session even though start()
             # already tries — belt-and-braces because start() can
@@ -543,10 +610,18 @@ class SshSessionTab(QWidget):
                 pass
             if self._destroyed:
                 return
+            # Translate paramiko / socket exceptions into a short,
+            # plain-English message so the user can tell at a glance
+            # whether the failure was DNS, refused, auth, or timeout.
+            # Serial sessions reuse this code path but their friendly
+            # text is already produced by SerialSession.start, so we
+            # only translate for the SSH branch.
+            if isinstance(profile, SerialProfile):
+                message = str(exc) or type(exc).__name__
+            else:
+                message = friendly_error(exc)
             try:
-                self._connect_failed_sig.emit(
-                    token, str(exc) or type(exc).__name__
-                )
+                self._connect_failed_sig.emit(token, message)
             except RuntimeError:
                 # Cross-thread bridge has been disconnected by
                 # shutdown(), or the underlying QObject has been
@@ -595,9 +670,7 @@ class SshSessionTab(QWidget):
             pass
         self._btn_reconnect.setEnabled(True)
         self._btn_disconnect.setEnabled(False)
-        self.log_appended.emit(
-            f"FAILED  {self.profile.user}@{self.profile.host}: {message}"
-        )
+        self.log_appended.emit(f"FAILED  {self._log_target()}: {message}")
 
     @pyqtSlot(int, object)
     def _on_connect_succeeded(self, token: int, session) -> None:
@@ -622,13 +695,25 @@ class SshSessionTab(QWidget):
         self._session = session
         self._opened_at = datetime.now()
         try:
-            self.terminal.attach_ssh(
-                session,
-                banner=(
-                    f"[connected to {self.profile.user}@"
-                    f"{self.profile.host}:{self.profile.port}]\n"
-                ),
-            )
+            if self._is_serial:
+                self.terminal.attach_ssh(
+                    session,
+                    banner=f"[opened {self.profile.summary()}]\n",
+                    line_ending=self.profile.line_ending,
+                    local_echo=self.profile.local_echo,
+                    backend_kind="serial",
+                )
+            else:
+                self.terminal.attach_ssh(
+                    session,
+                    banner=(
+                        f"[connected to {self.profile.user}@"
+                        f"{self.profile.host}:{self.profile.port}]\n"
+                    ),
+                    line_ending="cr",
+                    local_echo=False,
+                    backend_kind="ssh",
+                )
         except Exception as exc:
             # attach_ssh going sideways is extremely unlikely, but if
             # it does we must not leave the tab in a half-attached
@@ -642,16 +727,14 @@ class SshSessionTab(QWidget):
             self._btn_reconnect.setEnabled(True)
             self._btn_disconnect.setEnabled(False)
             self.log_appended.emit(
-                f"FAILED  {self.profile.user}@{self.profile.host}: attach error: {exc}"
+                f"FAILED  {self._log_target()}: attach error: {exc}"
             )
             return
 
         self._set_state(STATE_CONNECTED, "Connected")
         self._btn_reconnect.setEnabled(True)
         self._btn_disconnect.setEnabled(True)
-        self.log_appended.emit(
-            f"CONNECTED  {self.profile.user}@{self.profile.host}"
-        )
+        self.log_appended.emit(f"CONNECTED  {self._log_target()}")
 
     @pyqtSlot()
     def _on_terminal_session_closed(self) -> None:
@@ -669,9 +752,7 @@ class SshSessionTab(QWidget):
         self._set_state(STATE_CLOSED, "Disconnected")
         self._btn_reconnect.setEnabled(True)
         self._btn_disconnect.setEnabled(False)
-        self.log_appended.emit(
-            f"CLOSED  {self.profile.user}@{self.profile.host}"
-        )
+        self.log_appended.emit(f"CLOSED  {self._log_target()}")
 
     # ── State helper ─────────────────────────────────────────────────────────
 

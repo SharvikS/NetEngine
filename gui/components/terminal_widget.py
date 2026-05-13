@@ -2,15 +2,27 @@
 Embedded terminal widget.
 
 A `QPlainTextEdit` subclass that runs commands inside a persistent shell.
-Two backends are supported:
+Three backends are supported:
 
-  * "local"  — fires off subprocess.Popen for each command line typed by
-               the user.  Output is streamed back to the widget via a
-               worker thread.  Always available, no extra dependencies.
+  * "local"   — fires off subprocess.Popen for each command line typed
+                by the user.  Output is streamed back to the widget via
+                a worker thread.  Always available, no extra deps.
 
-  * "ssh"    — attaches to an `SSHSession` (paramiko invoke_shell channel),
-               echoes the remote bytes verbatim and forwards keystrokes
-               back to the channel.  Used by the SSH view.
+  * "ssh"     — attaches to an `SSHSession` (paramiko invoke_shell
+                channel), echoes the remote bytes verbatim and forwards
+                keystrokes back to the channel.  Used by the SSH view.
+
+  * "serial"  — attaches to a `SerialSession` (pyserial-backed COM port).
+                Same byte-stream interface as SSH; line endings (CR /
+                LF / CRLF) and local echo are configurable per session
+                so AT commands and UART consoles work the same way
+                they do in PuTTY.
+
+The "ssh" and "serial" modes share the same code path: the widget
+treats any session that exposes ``is_open / send / read_loop / resize
+/ close`` as a transport. Internally both are referred to as "remote"
+mode but the public hooks keep the historical "ssh" name for
+backwards compatibility.
 
 Designed to be theme-aware: re-styles itself when ThemeManager emits.
 """
@@ -35,6 +47,7 @@ from PyQt6.QtWidgets import QPlainTextEdit
 
 from gui.themes import ThemeManager, theme
 from scanner.ssh_client import SSHSession
+from utils.clipboard import copy_selected_text, copy_text, read_text
 
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -284,6 +297,25 @@ class TerminalWidget(QPlainTextEdit):
 
         self._ssh: Optional[SSHSession] = None
         self._ssh_reader: Optional[threading.Thread] = None
+        # Per-session I/O configuration. Defaults match historical SSH
+        # behavior: Enter sends bare CR (PTY shells turn that into a
+        # newline themselves) and the remote does its own echoing.
+        # Serial sessions override these via attach_ssh kwargs because
+        # AT-command devices and bare UART consoles often want CRLF
+        # and don't echo back at all.
+        #   _line_ending: bytes sent on the Enter key. One of b"\r",
+        #                 b"\n", or b"\r\n".
+        #   _local_echo:  if True, every byte we send to the session is
+        #                 also fed into the display so the user sees
+        #                 their input (PuTTY's "Local echo: Force on"
+        #                 mode).
+        #   _backend_kind: "ssh" or "serial" — picks Backspace byte
+        #                  (DEL 0x7f for SSH/xterm, BS 0x08 for serial)
+        #                  and selects display-erase behavior under
+        #                  local echo.
+        self._line_ending: bytes = b"\r"
+        self._local_echo: bool = False
+        self._backend_kind: str = "ssh"
         # Monotonic generation tag for the currently-attached SSH
         # session. Bumped on every attach + detach so stale worker
         # signals from an old session can be filtered out on the GUI
@@ -310,6 +342,18 @@ class TerminalWidget(QPlainTextEdit):
         # the previous chunk. A chunk boundary can easily fall in the
         # middle of something like ``\x1b[K``.
         self._ssh_pending: str = ""
+        # Latched after a CUP-home (``\x1b[H`` / ``\x1b[1;1H``) so
+        # that a following erase-in-display can be recognised as a
+        # *whole-screen* clear even when the shell sends the BusyBox
+        # style ``\x1b[H\x1b[J`` pair (erase-from-cursor-to-end).
+        # Without this latch, ``\x1b[J`` mode 0 would only erase the
+        # single line the cursor is sitting on, which is why
+        # BusyBox / minimal ``clear`` and readline's ``Ctrl+L`` on
+        # some Linux shells appeared to do nothing. The flag is
+        # cleared again by any printable output, control byte, or
+        # non-cursor CSI command — only the immediate H→J pair
+        # triggers the whole-screen interpretation.
+        self._ssh_home_pending: bool = False
         # Debounced PTY resize. Dragging the window fires resizeEvent
         # on every pixel; we coalesce those into a single
         # chan.resize_pty call after the user stops dragging.
@@ -385,12 +429,39 @@ class TerminalWidget(QPlainTextEdit):
     def is_busy(self) -> bool:
         return self._busy or self._mode == "ssh"
 
-    def attach_ssh(self, session: SSHSession, banner: str = "") -> None:
+    def attach_ssh(
+        self,
+        session,
+        banner: str = "",
+        *,
+        line_ending: str = "cr",
+        local_echo: bool = False,
+        backend_kind: str = "ssh",
+    ) -> None:
         """
-        Switch into SSH mode using an already-connected SSHSession.
+        Switch into remote mode using an already-connected session.
+
+        ``session`` may be an :class:`SSHSession` or any duck-typed
+        object that exposes ``is_open / send / read_loop / resize /
+        close`` — :class:`scanner.serial_client.SerialSession` qualifies
+        and is used by the Serial/UART tab.
+
+        Parameters
+        ----------
+        line_ending : "cr" | "lf" | "crlf"
+            What the Enter key sends on this session.  SSH PTYs expect
+            bare ``\\r`` (the default); AT-command devices and most
+            UART consoles want ``\\r\\n``.
+        local_echo : bool
+            If True, every byte we send is also written to the display
+            so the user can see their input.  Required for serial
+            devices that don't echo back.
+        backend_kind : "ssh" | "serial"
+            Selects Backspace semantics (xterm DEL 0x7f for SSH, BS
+            0x08 for serial) and a couple of secondary defaults.
 
         Any previously-attached session is torn down silently (no
-        "[ssh session closed]" line, no local prompt) so that a clean
+        "[session closed]" line, no local prompt) so that a clean
         reconnect over a live session only writes the new banner.
 
         Each attach bumps the internal generation counter so any
@@ -405,9 +476,17 @@ class TerminalWidget(QPlainTextEdit):
         self._mode = "ssh"
         self._ssh = session
         self._busy = False
+        self._line_ending = {
+            "cr":   b"\r",
+            "lf":   b"\n",
+            "crlf": b"\r\n",
+        }.get((line_ending or "cr").lower(), b"\r")
+        self._local_echo = bool(local_echo)
+        self._backend_kind = (backend_kind or "ssh").lower()
 
         # Reset the terminal-emulation state for this fresh session.
         self._ssh_pending = ""
+        self._ssh_home_pending = False
         self._ssh_utf8_decoder = codecs.getincrementaldecoder("utf-8")(
             errors="replace"
         )
@@ -440,6 +519,33 @@ class TerminalWidget(QPlainTextEdit):
         self.session_opened.emit()
         self._move_cursor_to_end()
         self.setFocus()
+
+    # Backend-agnostic alias matching the BaseTerminalSession naming
+    # convention. Internally this is the same code path as ``attach_ssh``
+    # because the widget already treats any ``is_open / send / read_loop /
+    # resize / close`` object as a transport — the only thing tied to the
+    # transport is the line-ending byte and the Backspace mapping, both
+    # configured per-call. New code should prefer ``attach_session``.
+    def attach_session(
+        self,
+        session,
+        *,
+        banner: str = "",
+        line_ending: str = "cr",
+        local_echo: bool = False,
+        backend_kind: str = "ssh",
+    ) -> None:
+        self.attach_ssh(
+            session,
+            banner=banner,
+            line_ending=line_ending,
+            local_echo=local_echo,
+            backend_kind=backend_kind,
+        )
+
+    def detach_session(self, *, silent: bool = False) -> None:
+        """Backend-agnostic alias for ``detach_ssh``."""
+        self.detach_ssh(silent=silent)
 
     def _run_reader(self, session: SSHSession, generation: int) -> None:
         """
@@ -519,6 +625,7 @@ class TerminalWidget(QPlainTextEdit):
         # from a clean slate (no stale decoder bytes, no leftover
         # escape sequence fragment, no stale cursor anchor).
         self._ssh_pending = ""
+        self._ssh_home_pending = False
         self._ssh_cursor_pos = 0
         self._ssh_utf8_decoder = codecs.getincrementaldecoder("utf-8")(
             errors="replace"
@@ -558,6 +665,54 @@ class TerminalWidget(QPlainTextEdit):
 
         self._sync_read_only()
         self.session_closed.emit()
+
+    # ── Per-session I/O config (line ending, local echo) ─────────────────────
+
+    def set_line_ending(self, mode: str) -> None:
+        """
+        Set what the Enter key sends on the current remote session.
+
+        ``mode`` is one of "cr", "lf", "crlf" (case-insensitive). Any
+        other value falls back to "cr". Safe to call from the GUI
+        thread at any time — it doesn't touch the underlying session.
+        """
+        self._line_ending = {
+            "cr":   b"\r",
+            "lf":   b"\n",
+            "crlf": b"\r\n",
+        }.get((mode or "cr").lower(), b"\r")
+
+    def line_ending(self) -> str:
+        """Return the current line-ending mode as 'cr' / 'lf' / 'crlf'."""
+        return {
+            b"\r":   "cr",
+            b"\n":   "lf",
+            b"\r\n": "crlf",
+        }.get(self._line_ending, "cr")
+
+    def set_local_echo(self, on: bool) -> None:
+        """
+        Enable / disable local echo of typed bytes back into the
+        display buffer. Required for serial devices that don't echo.
+        """
+        self._local_echo = bool(on)
+
+    def local_echo(self) -> bool:
+        return bool(self._local_echo)
+
+    def _local_echo_bytes(self, data: bytes) -> None:
+        """
+        Feed locally-typed bytes back through the remote-display
+        pipeline so the user sees them. Routed through the same
+        ``_ssh_chunk`` signal the read loop uses, so cursor tracking
+        and ANSI parsing stay consistent.
+        """
+        if not data or self._mode != "ssh":
+            return
+        try:
+            self._ssh_chunk.emit(self._ssh_generation, data)
+        except Exception:
+            pass
 
     # ── Read-only policy ─────────────────────────────────────────────────────
 
@@ -1002,10 +1157,12 @@ class TerminalWidget(QPlainTextEdit):
                         if i + 2 >= n:
                             self._ssh_pending = text[i:]
                             break
+                        self._ssh_home_pending = False
                         i += 3
                         continue
                     if nxt in "=>":
                         # Keypad application / numeric mode — ignore
+                        self._ssh_home_pending = False
                         i += 2
                         continue
                     if nxt == "M":
@@ -1014,14 +1171,17 @@ class TerminalWidget(QPlainTextEdit):
                             cursor.movePosition(
                                 QTextCursor.MoveOperation.PreviousBlock
                             )
+                        self._ssh_home_pending = False
                         i += 2
                         continue
                     if nxt in "78":
                         # DECSC / DECRC — save/restore cursor.
                         # We don't implement it; drop.
+                        self._ssh_home_pending = False
                         i += 2
                         continue
                     # Unknown escape — consume the intro byte only.
+                    self._ssh_home_pending = False
                     i += 2
                     continue
 
@@ -1030,6 +1190,7 @@ class TerminalWidget(QPlainTextEdit):
                     cursor.movePosition(
                         QTextCursor.MoveOperation.StartOfBlock
                     )
+                    self._ssh_home_pending = False
                     i += 1
                     continue
 
@@ -1045,6 +1206,7 @@ class TerminalWidget(QPlainTextEdit):
                             QTextCursor.MoveOperation.End
                         )
                         cursor.insertText("\n")
+                    self._ssh_home_pending = False
                     i += 1
                     continue
 
@@ -1053,11 +1215,15 @@ class TerminalWidget(QPlainTextEdit):
                         cursor.movePosition(
                             QTextCursor.MoveOperation.Left
                         )
+                    self._ssh_home_pending = False
                     i += 1
                     continue
 
                 if ch == "\x07":
-                    # BEL — silently ignored (no audible bell, no visual)
+                    # BEL — silently ignored (no audible bell, no visual).
+                    # Does not invalidate the home-pending latch because
+                    # a bell between H and J shouldn't change the
+                    # intent of the clear pair.
                     i += 1
                     continue
 
@@ -1065,6 +1231,7 @@ class TerminalWidget(QPlainTextEdit):
                     col = cursor.positionInBlock()
                     spaces = 8 - (col % 8)
                     self._ssh_insert_overwrite(cursor, " " * spaces)
+                    self._ssh_home_pending = False
                     i += 1
                     continue
 
@@ -1086,6 +1253,7 @@ class TerminalWidget(QPlainTextEdit):
                     i += 1
                 run = text[run_start:i]
                 if run:
+                    self._ssh_home_pending = False
                     self._ssh_insert_overwrite(cursor, run)
 
             # Save the new terminal cursor position so the next chunk
@@ -1138,6 +1306,12 @@ class TerminalWidget(QPlainTextEdit):
         if params_str.startswith("?"):
             params_str = params_str[1:]
 
+        # Snapshot the home-pending latch. ``H`` re-arms it; ``J``
+        # consumes it; every other CSI final byte silently drops it.
+        home_was_pending = self._ssh_home_pending
+        if final_ch not in ("H", "f", "J"):
+            self._ssh_home_pending = False
+
         params: list[int] = []
         for p in params_str.split(";"):
             if p == "":
@@ -1188,6 +1362,25 @@ class TerminalWidget(QPlainTextEdit):
 
         if final_ch == "J":
             mode = params[0] if params else 0
+            # BusyBox / readline / minimal ``clear`` implementations
+            # send ``\x1b[H\x1b[J`` as the entire clear-screen
+            # sequence (mode 0 = "erase from cursor to end of
+            # display"). In a real fixed-grid terminal this wipes
+            # the whole visible area because ``\x1b[H`` has just
+            # parked the cursor at the top-left. Our linear
+            # document has no fixed grid, so mode 0 on its own
+            # would only erase from the cursor down — which in the
+            # post-home state means "the empty line under the
+            # prompt" and looks like clear does nothing.
+            #
+            # Promote mode 0 to a full clear iff the immediately-
+            # preceding command was a CUP-home. That keeps mid-
+            # screen usages of ``\x1b[J`` (output streaming, less,
+            # etc.) behaving exactly as before.
+            if mode == 0 and home_was_pending:
+                mode = 2
+            # Any erase-in-display consumes the home-pending latch.
+            self._ssh_home_pending = False
             if mode == 0:
                 cursor.movePosition(
                     QTextCursor.MoveOperation.End,
@@ -1201,7 +1394,13 @@ class TerminalWidget(QPlainTextEdit):
                 )
                 cursor.removeSelectedText()
             elif mode in (2, 3):
-                # Clear screen — blow the whole document away.
+                # Clear screen / clear scrollback — blow the whole
+                # document away and re-seat the caller's cursor at
+                # the start of the now-empty document. The next
+                # printable run in this same chunk (typically the
+                # prompt that the shell emits right after ``clear``)
+                # therefore lands at the top of the buffer instead
+                # of tailing stale position data.
                 self.clear()
                 cursor.setPosition(0)
                 self._ssh_cursor_pos = 0
@@ -1254,10 +1453,18 @@ class TerminalWidget(QPlainTextEdit):
 
         if final_ch in ("H", "f"):
             # CUP — row;col. A linear text document has no fixed
-            # grid, so "home" (no params) is the only case we can
-            # do usefully: jump to the start of the last line.
+            # grid, so "home" (no params or 1;1) is the only case
+            # we can do usefully: jump to the start of the last
+            # line. The home-pending latch is set so a following
+            # ``\x1b[J`` (erase-to-end) is recognised as a whole-
+            # screen clear rather than an erase of the single line
+            # the cursor is sitting on — see the CSI J handler for
+            # the full rationale.
             cursor.movePosition(QTextCursor.MoveOperation.End)
             cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+            row = params[0] if len(params) >= 1 and params[0] > 0 else 1
+            col = params[1] if len(params) >= 2 and params[1] > 0 else 1
+            self._ssh_home_pending = (row == 1 and col == 1)
             return
 
         if final_ch == "P":
@@ -1367,6 +1574,16 @@ class TerminalWidget(QPlainTextEdit):
         if self._mode == "ssh":
             session = self._ssh
             if session is not None and session.is_open:
+                # Copy / paste shortcuts are intercepted *before* the
+                # key reaches the remote. Ctrl+Shift+C, Ctrl+Insert
+                # copy the current selection; Ctrl+Shift+V and
+                # Shift+Insert paste clipboard text back into the
+                # remote shell. Ctrl+C with an active selection
+                # copies (and clears the selection) so that a
+                # following bare Ctrl+C still reaches the remote as
+                # SIGINT — remote Ctrl+C semantics stay intact.
+                if self._handle_ssh_copy_paste_shortcut(event):
+                    return
                 self._handle_ssh_key(event)
                 return
             # In SSH mode but the session is already gone — swallow
@@ -1377,13 +1594,16 @@ class TerminalWidget(QPlainTextEdit):
 
         # ── Idle mode: swallow everything so the buffer stays clean ─────────
         # Only copy shortcuts are allowed through so the user can still
-        # lift text out of the terminal with Ctrl+C / Ctrl+Insert.
+        # lift text out of the terminal with Ctrl+C / Ctrl+Shift+C /
+        # Ctrl+Insert. We route through the clipboard helper so the
+        # Unicode paragraph separator Qt emits for selections becomes
+        # plain \n on the system clipboard.
         if self._mode == "idle":
             mods = event.modifiers()
             key = event.key()
-            if (mods & Qt.KeyboardModifier.ControlModifier
-                    and key in (Qt.Key.Key_C, Qt.Key.Key_Insert)):
-                super().keyPressEvent(event)
+            ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+            if ctrl and key in (Qt.Key.Key_C, Qt.Key.Key_Insert):
+                copy_selected_text(self)
             # Otherwise: eat the event.
             return
 
@@ -1439,12 +1659,20 @@ class TerminalWidget(QPlainTextEdit):
             return
 
         if key == Qt.Key.Key_C and mods & Qt.KeyboardModifier.ControlModifier:
-            # Copy if there's a selection; otherwise clear current input.
+            # Copy if there's a selection; otherwise abort current input.
+            # Selections copy via the clipboard helper so multi-line
+            # selections land on the clipboard with real newlines
+            # instead of Qt's U+2029 paragraph separators.
             if cursor.hasSelection():
-                super().keyPressEvent(event)
+                copy_selected_text(self)
                 return
             self._append("^C\n")
             self._show_local_prompt(banner=False)
+            return
+
+        if (key == Qt.Key.Key_Insert
+                and mods & Qt.KeyboardModifier.ControlModifier):
+            copy_selected_text(self)
             return
 
         if key == Qt.Key.Key_L and mods & Qt.KeyboardModifier.ControlModifier:
@@ -1453,6 +1681,99 @@ class TerminalWidget(QPlainTextEdit):
             return
 
         super().keyPressEvent(event)
+
+    def _handle_ssh_copy_paste_shortcut(self, event: QKeyEvent) -> bool:
+        """
+        Handle clipboard shortcuts in SSH mode.
+
+        Returns ``True`` if the event was consumed (copy / paste) and
+        must NOT be forwarded to the remote shell; ``False`` if the
+        caller should continue with normal remote-key dispatch.
+
+        Shortcut map — chosen to match PuTTY / GNOME Terminal / xterm
+        conventions so users coming from those tools don't have to
+        re-learn anything:
+
+        * ``Ctrl+Shift+C`` / ``Ctrl+Insert`` — copy selection.
+        * ``Ctrl+Shift+V`` / ``Shift+Insert`` — paste.
+        * ``Ctrl+C`` with an active selection — copy and clear the
+          selection. The next bare ``Ctrl+C`` therefore reaches the
+          remote shell as SIGINT, preserving interrupt semantics.
+        """
+        key = event.key()
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+
+        if ctrl and shift and key == Qt.Key.Key_C:
+            copy_selected_text(self)
+            return True
+        if ctrl and not shift and key == Qt.Key.Key_Insert:
+            copy_selected_text(self)
+            return True
+        if ctrl and shift and key == Qt.Key.Key_V:
+            self._paste_to_ssh()
+            return True
+        if shift and not ctrl and key == Qt.Key.Key_Insert:
+            self._paste_to_ssh()
+            return True
+
+        # Ctrl+C with selection → copy. No selection → fall through
+        # so ``_handle_ssh_key`` sends \x03 (SIGINT) to the remote.
+        if ctrl and not shift and key == Qt.Key.Key_C:
+            cur = self.textCursor()
+            if cur.hasSelection():
+                copy_selected_text(self)
+                cur.clearSelection()
+                self.setTextCursor(cur)
+                return True
+
+        return False
+
+    def _paste_to_ssh(self) -> None:
+        """
+        Send the current system clipboard contents to the remote
+        session as if the user had typed the text.
+
+        Newlines are normalised to the session's configured line
+        ending. For SSH (default ``cr``) that matches historical
+        behavior — Windows editors paste their CRLF lines into a PTY
+        as bare CR. For Serial sessions, newlines are emitted as the
+        configured CR / LF / CRLF so a multi-line AT-command paste
+        arrives at the device the same way each typed Enter would.
+
+        If the clipboard is empty or unreadable this is a silent no-op.
+        """
+        if self._shutting_down or self._mode != "ssh":
+            return
+        session = self._ssh
+        if session is None or not session.is_open:
+            return
+        text = read_text()
+        if not text:
+            return
+        # Collapse Windows + classic-Mac line breaks to a single
+        # internal LF first, then re-emit as the configured ending.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        ending = self._line_ending.decode("ascii", errors="replace")
+        # Historical SSH default of bare \r matches the old behavior;
+        # in that case feed the shell each line terminated with \n
+        # rather than rebuilding into LF (the PTY's onlcr maps it).
+        if ending == "\r":
+            payload = text  # PTY converts each \n into the prompt's newline
+        else:
+            payload = text.replace("\n", ending)
+        data = payload.encode("utf-8", errors="replace")
+        try:
+            session.send(data)
+        except Exception:
+            return
+        if self._local_echo:
+            # Echo the pasted block back so the user sees it. We use
+            # CRLF as the visual line break regardless of what we
+            # actually sent on the wire.
+            visible = text.replace("\n", "\r\n")
+            self._local_echo_bytes(visible.encode("utf-8", errors="replace"))
 
     def _handle_ssh_key(self, event: QKeyEvent) -> None:
         session = self._ssh
@@ -1465,13 +1786,41 @@ class TerminalWidget(QPlainTextEdit):
 
         # Special key mappings → escape sequences understood by xterm shells.
         if key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
-            session.send(b"\r")
+            # The line-ending is per-session: SSH PTYs default to bare
+            # CR (the PTY's icrnl maps it to a newline), serial AT
+            # devices typically need CR-LF or LF.
+            session.send(self._line_ending)
+            if self._local_echo:
+                # Visually advance to a fresh line regardless of the
+                # ending we sent on the wire.
+                self._local_echo_bytes(b"\r\n")
             return
         if key == Qt.Key.Key_Backspace:
-            session.send(b"\x7f")
+            # Ctrl+Backspace → ^W (delete previous word), matching
+            # bash / readline. Plain Backspace sends DEL (0x7f) for
+            # SSH/xterm shells (where readline expects DEL) and BS
+            # (0x08) for raw serial devices, which is the convention
+            # most embedded UART firmware uses for line editing.
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                session.send(b"\x17")
+            elif self._backend_kind == "serial":
+                session.send(b"\x08")
+                if self._local_echo:
+                    # Erase one cell visually: BS, space, BS.
+                    self._local_echo_bytes(b"\b \b")
+            else:
+                session.send(b"\x7f")
+                # SSH normally relies on remote echo (readline draws
+                # the erase). When local echo is forced on, mirror it.
+                if self._local_echo:
+                    self._local_echo_bytes(b"\b \b")
             return
         if key == Qt.Key.Key_Tab:
             session.send(b"\t")
+            return
+        if key == Qt.Key.Key_Backtab:
+            # Shift+Tab — standard reverse-tab CSI.
+            session.send(b"\x1b[Z")
             return
         if key == Qt.Key.Key_Up:
             session.send(b"\x1b[A")
@@ -1491,25 +1840,106 @@ class TerminalWidget(QPlainTextEdit):
         if key == Qt.Key.Key_End:
             session.send(b"\x1b[F")
             return
+        if key == Qt.Key.Key_PageUp:
+            session.send(b"\x1b[5~")
+            return
+        if key == Qt.Key.Key_PageDown:
+            session.send(b"\x1b[6~")
+            return
+        if key == Qt.Key.Key_Insert:
+            session.send(b"\x1b[2~")
+            return
         if key == Qt.Key.Key_Delete:
             session.send(b"\x1b[3~")
             return
         if key == Qt.Key.Key_Escape:
             session.send(b"\x1b")
             return
+        # Function keys — xterm sequences, the lingua franca of
+        # remote shells and TUIs (htop, less, vim, midnight commander).
+        if key == Qt.Key.Key_F1:
+            session.send(b"\x1bOP")
+            return
+        if key == Qt.Key.Key_F2:
+            session.send(b"\x1bOQ")
+            return
+        if key == Qt.Key.Key_F3:
+            session.send(b"\x1bOR")
+            return
+        if key == Qt.Key.Key_F4:
+            session.send(b"\x1bOS")
+            return
+        if key == Qt.Key.Key_F5:
+            session.send(b"\x1b[15~")
+            return
+        if key == Qt.Key.Key_F6:
+            session.send(b"\x1b[17~")
+            return
+        if key == Qt.Key.Key_F7:
+            session.send(b"\x1b[18~")
+            return
+        if key == Qt.Key.Key_F8:
+            session.send(b"\x1b[19~")
+            return
+        if key == Qt.Key.Key_F9:
+            session.send(b"\x1b[20~")
+            return
+        if key == Qt.Key.Key_F10:
+            session.send(b"\x1b[21~")
+            return
+        if key == Qt.Key.Key_F11:
+            session.send(b"\x1b[23~")
+            return
+        if key == Qt.Key.Key_F12:
+            session.send(b"\x1b[24~")
+            return
 
-        # Ctrl-letter → control character
-        if mods & Qt.KeyboardModifier.ControlModifier and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+        # Ctrl-letter → control character.
+        # Ctrl+L lands here and is sent as 0x0C, which readline /
+        # bash interpret as "clear screen and redraw prompt". On
+        # shells without readline (BusyBox ash) the byte is a no-op —
+        # that is accurate remote-terminal behavior, not a client bug.
+        if (mods & Qt.KeyboardModifier.ControlModifier
+                and Qt.Key.Key_A <= key <= Qt.Key.Key_Z):
             ctrl = bytes([key - Qt.Key.Key_A + 1])
             session.send(ctrl)
             return
 
+        # Alt+<printable ASCII> → ESC + char. readline interprets
+        # this as "meta" for word-level cursor moves (Alt+b, Alt+f,
+        # Alt+d, …). Only triggered for a single ASCII character to
+        # keep Windows Alt+F4 / Alt+Tab / menu mnemonics untouched.
+        if (mods & Qt.KeyboardModifier.AltModifier
+                and not (mods & Qt.KeyboardModifier.ControlModifier)
+                and text and len(text) == 1 and 0x20 <= ord(text) < 0x7f):
+            session.send(b"\x1b" + text.encode("ascii", errors="replace"))
+            # Alt-meta is invisible by convention — don't echo even
+            # when local_echo is on; the ESC byte would garble the
+            # display.
+            return
+
         if text:
-            session.send(text.encode("utf-8", errors="replace"))
+            data = text.encode("utf-8", errors="replace")
+            session.send(data)
+            if self._local_echo:
+                self._local_echo_bytes(data)
 
     # ── Mouse: keep selection but force cursor to end after click ────────────
 
     def mousePressEvent(self, event):
+        # X11 / xterm / PuTTY-style middle-click paste: the clipboard
+        # contents are fed to the remote shell as keyboard input.
+        # Handled *before* super() so Qt doesn't try to interpret the
+        # middle button as a cursor-move click. We only paste in SSH
+        # mode — in local mode the widget has its own input anchor
+        # model and pasting into the middle of the prompt would be
+        # confusing.
+        if (event.button() == Qt.MouseButton.MiddleButton
+                and self._mode == "ssh"):
+            self._paste_to_ssh()
+            event.accept()
+            return
+
         super().mousePressEvent(event)
         # Don't trap selection — only refocus cursor when no selection
         # is being made and the user clicked above the input anchor.
@@ -1517,6 +1947,31 @@ class TerminalWidget(QPlainTextEdit):
             cursor = self.textCursor()
             if cursor.position() < self._input_anchor:
                 self._move_cursor_to_end()
+
+    def mouseReleaseEvent(self, event):
+        """
+        PuTTY-style auto-copy on selection release.
+
+        When the user finishes a left-click drag that produced a
+        non-empty selection, the selected text is pushed to the system
+        clipboard immediately — no context menu click or keyboard
+        shortcut required. The visible selection is preserved so the
+        user keeps their visual confirmation of what was copied.
+        """
+        super().mouseReleaseEvent(event)
+        if self._shutting_down:
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        try:
+            cursor = self.textCursor()
+        except RuntimeError:
+            return
+        if not cursor.hasSelection():
+            return
+        # copy_selected_text is a no-op if the clipboard is
+        # temporarily unavailable, so this stays silent on failure.
+        copy_selected_text(self)
 
     # ── History ─────────────────────────────────────────────────────────────
 

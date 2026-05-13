@@ -95,6 +95,7 @@ from scanner.transfer_manager import (
 )
 from scanner.remote_edit_tracker import RemoteEditTracker, TrackedEdit
 from utils.editor_launcher import open_file as _launch_editor, EditorError
+from utils.clipboard import copy_text
 
 
 # ── Small value types ────────────────────────────────────────────────────
@@ -166,6 +167,24 @@ class _PendingOpen:
     session_id: int
 
 
+@dataclass
+class _SilentOpenResult:
+    """
+    Outcome of a silent remote-open fetch. On success all three error
+    fields are empty. On failure ``scp_error`` holds the Stage A
+    failure string and ``shell_error`` holds the Stage B failure
+    string — either may be empty if that stage was skipped.
+    """
+    pending: _PendingOpen
+    error: str = ""           # kept for the "we never started" case
+    scp_error: str = ""
+    shell_error: str = ""
+
+    @property
+    def failed(self) -> bool:
+        return bool(self.error or self.scp_error or self.shell_error)
+
+
 # ── Background browsing workers ───────────────────────────────────────────
 
 class _BrowseSignals(QObject):
@@ -174,6 +193,166 @@ class _BrowseSignals(QObject):
     mkdir_done    = pyqtSignal(str, bool, str)            # path, ok, error
     delete_done   = pyqtSignal(str, bool, str)            # path, ok, error
     rename_done   = pyqtSignal(str, str, bool, str)       # old, new, ok, error
+    silent_open_done = pyqtSignal(object)                 # _SilentOpenResult
+
+
+class _SilentOpenJob(QRunnable):
+    """
+    Background fetch of a single remote file into a local temp dir,
+    bypassing the visible transfer queue. This is the worker behind
+    the WinSCP-style double-click-to-edit flow in the File Transfer
+    view.
+
+    Two-stage read strategy
+    -----------------------
+    Stage A: real SCP via ``ScpTransferEngine.get_file``. This is the
+             primary protocol — fast, correct, and already serialised
+             against other SCP transfers through the engine's lock.
+
+    Stage B: shell ``cat`` fallback via
+             ``ScpTransferEngine.shell_read_file``. Activates
+             automatically and silently when Stage A fails for any
+             reason — missing remote scp binary, Dropbear scp quirks,
+             permission wedges, short reads, channel weirdness. Works
+             on BusyBox / OpenWrt / stripped embedded Linux userlands
+             because it only depends on ``test``, ``wc`` or ``stat``,
+             and ``cat`` — all of which BusyBox ships in its base
+             build.
+
+    Failure reporting
+    -----------------
+    Each stage's error is stashed on the result object. If both stages
+    fail the UI slot sees a single structured failure describing which
+    stage tried what and why, so users never see a bare "SCP read
+    failed" with no recovery hint.
+    """
+    def __init__(
+        self,
+        engine: ScpTransferEngine,
+        pending: _PendingOpen,
+        sig: _BrowseSignals,
+    ):
+        super().__init__()
+        self._engine = engine
+        self._pending = pending
+        self._sig = sig
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        local_dir = os.path.dirname(self._pending.local_target)
+        local_name = os.path.basename(self._pending.local_target)
+        remote_path = self._pending.remote_source
+
+        if self._engine is None:
+            self._emit_failure(
+                scp_error="SCP engine not bound to a session",
+                shell_error="",
+            )
+            return
+
+        # Stage A: real SCP fetch.
+        scp_err = ""
+        try:
+            self._engine.get_file(
+                remote_path,
+                local_dir,
+                local_name=local_name,
+            )
+            self._emit_success()
+            return
+        except Exception as exc:
+            scp_err = _trim_error(exc)
+
+        # Stage B: shell cat fallback. Runs unconditionally when SCP
+        # fails — we already paid the cost of opening the editor
+        # pipeline so the user should never see a recoverable failure.
+        try:
+            self._engine.shell_read_file(
+                remote_path,
+                local_dir,
+                local_name=local_name,
+            )
+            self._emit_success()
+            return
+        except Exception as exc:
+            self._emit_failure(
+                scp_error=scp_err,
+                shell_error=_trim_error(exc),
+            )
+
+    def _emit_success(self) -> None:
+        self._sig.silent_open_done.emit(
+            _SilentOpenResult(pending=self._pending, error="")
+        )
+
+    def _emit_failure(self, *, scp_error: str, shell_error: str) -> None:
+        self._sig.silent_open_done.emit(
+            _SilentOpenResult(
+                pending=self._pending,
+                error="",
+                scp_error=scp_error,
+                shell_error=shell_error,
+            )
+        )
+
+
+def _trim_error(exc: BaseException) -> str:
+    """Collapse an exception into a one-line human-readable summary."""
+    text = str(exc) or exc.__class__.__name__
+    text = " ".join(text.split())
+    return text[:400]
+
+
+def _classify_open_error(result: "_SilentOpenResult") -> str:
+    """
+    Bucket a two-stage silent-open failure into a short category key
+    so the UI can show a user-facing headline instead of a raw
+    protocol error. Categories: ``missing``, ``directory``,
+    ``permission``, ``offline``, ``unsupported``, ``other``.
+
+    Rules of thumb:
+
+    * ``missing``    — the shell fallback's probe reported MISSING,
+                       or SCP said "No such file".
+    * ``directory``  — the remote path is a directory.
+    * ``permission`` — either stage said permission denied.
+    * ``offline``    — session/transport errors from either stage.
+    * ``unsupported``— both stages failed with "not installed / not
+                       found / not supported" (usually a stripped
+                       remote that even lacks cat).
+    * ``other``      — anything else. The caller shows raw details
+                       for this bucket.
+    """
+    blob = " ".join([
+        result.error or "",
+        result.scp_error or "",
+        result.shell_error or "",
+    ]).lower()
+    if not blob.strip():
+        return "other"
+    if "permission denied" in blob:
+        return "permission"
+    if "not found" in blob or "no such file" in blob or "missing" in blob:
+        return "missing"
+    if "is a directory" in blob or "isdir" in blob:
+        return "directory"
+    if (
+        "not connected" in blob
+        or "transport" in blob
+        or "session closed" in blob
+        or "session is not" in blob
+        or "not bound" in blob
+        or "engine not bound" in blob
+    ):
+        return "offline"
+    if (
+        "not installed" in blob
+        or "command not found" in blob
+        or "not supported" in blob
+        or "may not be installed" in blob
+    ):
+        return "unsupported"
+    return "other"
 
 
 class _ListDirJob(QRunnable):
@@ -432,6 +611,7 @@ class FileTransferView(QWidget):
         self._browse_sig.mkdir_done.connect(self._on_remote_mkdir_done)
         self._browse_sig.delete_done.connect(self._on_remote_delete_done)
         self._browse_sig.rename_done.connect(self._on_remote_rename_done)
+        self._browse_sig.silent_open_done.connect(self._on_silent_open_done)
 
         self._thread_pool = QThreadPool.globalInstance()
 
@@ -472,14 +652,11 @@ class FileTransferView(QWidget):
             self._local_collapsed = False
         self._local_saved_sizes: list[int] = []
 
-        # Deferred-open registry: when the user double-clicks a remote
-        # file, we enqueue a DOWNLOAD_FILE job and record the full
-        # pending-open metadata here. When the job finishes the
-        # handler pops the entry and hands it to the editor launcher.
-        # We keep the remote source alongside the local target so the
-        # RemoteEditTracker can register the edit with the correct
-        # remote origin after the editor launches.
-        self._open_after_download: dict[int, _PendingOpen] = {}
+        # Active silent-open fetches, keyed by temp target path. Used
+        # only to deduplicate rapid double-clicks on the same remote
+        # file — the actual download runs off the visible transfer
+        # queue on a QThreadPool worker, so there's no job id to stash.
+        self._silent_opens_in_flight: set[str] = set()
 
         # Per-session temp cache for remote opens. Lazily created on
         # the first open; torn down in shutdown().
@@ -1624,7 +1801,7 @@ class FileTransferView(QWidget):
         if len(rows) == 1 and not self._is_dir_row(self._tbl_remote, rows[0]):
             single_file_row = rows[0]
 
-        a_open = menu.addAction("Open (download + local editor)")
+        a_open = menu.addAction("Open in editor")
         a_open.setEnabled(
             single_file_row is not None and self._scp_engine is not None
         )
@@ -1951,29 +2128,32 @@ class FileTransferView(QWidget):
         paths = [p for p in paths if p]
         if not paths:
             return
-        QApplication.clipboard().setText("\n".join(paths))
-        self.status_message.emit(
-            f"Copied {len(paths)} path{'s' if len(paths) != 1 else ''} to clipboard"
-        )
+        joined = "\n".join(paths)
+        if copy_text(joined):
+            self.status_message.emit(
+                f"Copied {len(paths)} "
+                f"path{'s' if len(paths) != 1 else ''} to clipboard"
+            )
+        else:
+            self.status_message.emit(
+                "Copy path failed — clipboard is temporarily unavailable"
+            )
 
-    # ─── Remote file "Open" flow (download-to-temp, then launch) ────────
-
-    _OPEN_WARN_THRESHOLD_BYTES = 20 * 1024 * 1024   # 20 MB
+    # ─── Remote file "Open" flow (silent fetch, then launch) ────────────
 
     def _open_remote_file(self, remote_path: str, size_hint: int) -> None:
         """
-        Download ``remote_path`` into a fresh per-open temp directory
-        and, once the SCP transfer finishes, open it in the user's
-        preferred local editor.
+        WinSCP-style silent open: stream ``remote_path`` into a fresh
+        per-open temp directory on a background worker, then hand it
+        to the user's preferred local editor. The SCP fetch runs off
+        the visible transfer queue and emits no progress chatter —
+        from the user's perspective, double-clicking a remote file
+        just opens it.
 
-        The download is placed inside a unique temp subdirectory so
-        two concurrent opens of files with the same name (e.g. two
-        ``config`` files from different remote paths) never clash.
-
-        Large files prompt a confirmation first: SCP will happily
-        pull a 4 GB log file into a temp cache, but we'd rather make
-        that deliberate than let the user accidentally freeze their
-        editor.
+        ``size_hint`` is accepted for call-site compatibility but
+        deliberately ignored: no large-file confirmation prompt, by
+        design. A save inside the editor is still picked up by the
+        remote-edit tracker and surfaces the reupload bar.
         """
         if self._scp_engine is None:
             self._warn(
@@ -1985,24 +2165,6 @@ class FileTransferView(QWidget):
         if not remote_path:
             return
 
-        # Large-file guard. If we don't know the size (size_hint == 0,
-        # e.g. shell browser failed to stat) we don't warn — erring
-        # on the side of honouring the user's action.
-        if size_hint and size_hint > self._OPEN_WARN_THRESHOLD_BYTES:
-            friendly = _format_size(size_hint)
-            res = QMessageBox.question(
-                self,
-                "Open large remote file?",
-                f"{os.path.basename(remote_path)} is {friendly}.\n\n"
-                f"Opening will download the whole file into a local "
-                f"temporary cache and then launch an editor. "
-                f"Continue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if res != QMessageBox.StandardButton.Yes:
-                return
-
         try:
             subdir = self._ensure_open_subdir()
         except OSError as exc:
@@ -2010,24 +2172,21 @@ class FileTransferView(QWidget):
             return
 
         local_target = os.path.join(subdir, os.path.basename(remote_path))
-        jid = self._transfers.enqueue(
-            JobKind.DOWNLOAD_FILE,
-            source=remote_path,
-            destination=subdir,
-            display_name=f"▼ open · {os.path.basename(remote_path)}",
-            size_hint=size_hint,
-        )
-        self._open_after_download[jid] = _PendingOpen(
+        if local_target in self._silent_opens_in_flight:
+            return
+        self._silent_opens_in_flight.add(local_target)
+
+        pending = _PendingOpen(
             local_target=local_target,
             remote_source=remote_path,
             session_id=int(self._bound_session_id or 0),
         )
-        # Make the remote-staging step explicit — this is the only
-        # place in the view where an open triggers an SCP download,
-        # and we want the status line to say so clearly.
-        self.status_message.emit(
-            f"Staging remote file {os.path.basename(remote_path)} "
-            f"for open (SCP download to local temp cache)…"
+        self._thread_pool.start(
+            _SilentOpenJob(
+                self._scp_engine,
+                pending,
+                self._browse_sig,
+            )
         )
 
     def _ensure_open_subdir(self) -> str:
@@ -2362,11 +2521,6 @@ class FileTransferView(QWidget):
     def _on_job_finished(self, job_id: int, status: str, message: str) -> None:
         self._rebuild_queue_table()
 
-        # Deferred open — if this job was started by the "open remote
-        # file" flow, pull the pending-open metadata out of the
-        # registry regardless of status so we never leak entries.
-        pending_open = self._open_after_download.pop(job_id, None)
-
         # Reupload job — if this upload was started from the reupload
         # bar, pop the temp-path entry so the tracker bookkeeping
         # runs on the success branch below.
@@ -2375,14 +2529,7 @@ class FileTransferView(QWidget):
         if status == "done":
             self.status_message.emit("Transfer complete")
             job = self._transfers.get_job(job_id)
-            if pending_open:
-                # A remote-open transfer finished successfully. Launch
-                # the editor on the staged file and register the edit
-                # with the tracker so a later save triggers the
-                # reupload flow. Do NOT refresh the local pane — the
-                # temp cache isn't the user's browsed directory.
-                self._launch_pending_open(pending_open)
-            elif reupload_temp:
+            if reupload_temp:
                 # Successful reupload → update the tracker's ack/
                 # uploaded mtimes so the next save triggers a fresh
                 # prompt. Don't refresh the remote pane; the user
@@ -2407,52 +2554,110 @@ class FileTransferView(QWidget):
                     )
         elif status == "cancelled":
             self.status_message.emit("Transfer cancelled")
-            if pending_open:
-                self.status_message.emit(
-                    f"Open cancelled · {os.path.basename(pending_open.local_target)}"
-                )
         else:
             self.status_message.emit(f"Transfer failed: {message}")
-            if pending_open:
-                self._warn(
-                    "Open remote file",
-                    f"Download of "
-                    f"{os.path.basename(pending_open.local_target)} "
-                    f"failed:\n\n{message}",
-                )
-            elif reupload_temp:
+            if reupload_temp:
                 self._warn(
                     "Reupload failed",
                     f"Re-upload of {os.path.basename(reupload_temp)} "
                     f"failed:\n\n{message}",
                 )
 
-    def _launch_pending_open(self, pending: _PendingOpen) -> None:
-        """Hand a successfully-downloaded temp file to the editor launcher."""
+    @pyqtSlot(object)
+    def _on_silent_open_done(self, result: _SilentOpenResult) -> None:
+        """
+        Completion slot for the two-stage silent remote-open fetch.
+        Runs on the Qt main thread via signal hop.
+
+        On success: launch the local editor and register the temp
+        file with the edit tracker so a later save surfaces the
+        reupload bar.
+
+        On failure: show a stage-aware error dialog that translates
+        the raw protocol error into something the user can act on
+        (permission, missing, unsupported, host offline, …) rather
+        than a bare "SCP read failed".
+        """
+        if self._destroyed:
+            return
+        pending = result.pending
+        self._silent_opens_in_flight.discard(pending.local_target)
+
+        if result.failed:
+            self._show_open_failure(pending, result)
+            return
+
         local_path = pending.local_target
         if not os.path.isfile(local_path):
             self._warn(
                 "Open remote file",
-                f"Download reported success but the staged file is "
-                f"missing:\n\n{local_path}",
+                f"Fetch reported success but the staged file is "
+                f"missing on disk:\n\n{local_path}",
             )
             return
         try:
             tool = _launch_editor(local_path)
         except EditorError as exc:
-            self._warn("Open remote file", str(exc))
+            self._warn(
+                "Open remote file",
+                f"Fetched {os.path.basename(local_path)} to local "
+                f"cache but could not launch an editor:\n\n{exc}",
+            )
             return
         except Exception as exc:
-            self._warn("Open remote file", f"Could not launch editor: {exc}")
+            self._warn(
+                "Open remote file",
+                f"Could not launch editor: {exc}",
+            )
             return
         # Register with the edit tracker so a later save triggers the
         # reupload prompt. This is what turns the "open remote file"
         # flow into a WinSCP-style edit-and-save round trip.
         self._register_tracked_edit(pending)
         self.status_message.emit(
-            f"Opened remote file {os.path.basename(local_path)} "
-            f"in {tool} (editing tracked — save to trigger reupload)"
+            f"Opened {os.path.basename(local_path)} in {tool}"
         )
+
+    def _show_open_failure(
+        self,
+        pending: _PendingOpen,
+        result: _SilentOpenResult,
+    ) -> None:
+        """Classify a two-stage open failure and show one clean dialog."""
+        name = os.path.basename(pending.remote_source) or pending.remote_source
+        reason = _classify_open_error(result)
+
+        headline = {
+            "missing":    f"{name}: file not found on the remote host.",
+            "directory":  f"{name}: this is a directory — cannot open as a file.",
+            "permission": f"{name}: permission denied.",
+            "offline":    f"{name}: SSH session is not connected.",
+            "unsupported":
+                f"{name}: the remote host does not support either "
+                f"SCP or a readable shell fallback.",
+            "other":      f"Could not open {name}.",
+        }[reason]
+
+        # Stage-by-stage detail, only included for the "other" class
+        # where the user will benefit from seeing both errors. For
+        # clearly classified failures (permission / missing / …) the
+        # headline alone is enough.
+        if reason == "other":
+            detail_lines = []
+            if result.error:
+                detail_lines.append(f"• {result.error}")
+            if result.scp_error:
+                detail_lines.append(f"• SCP: {result.scp_error}")
+            if result.shell_error:
+                detail_lines.append(f"• Shell fallback: {result.shell_error}")
+            body = headline + "\n\nTried:\n" + "\n".join(
+                detail_lines or ["• (no detail)"]
+            )
+        else:
+            body = headline
+
+        self._warn("Open remote file", body)
+        self.status_message.emit(f"Open failed: {name}")
 
     def _on_local_collapse_toggle(self) -> None:
         """

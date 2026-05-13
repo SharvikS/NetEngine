@@ -9,8 +9,10 @@ Built-in themes:
     Dark                  — polished cyan-on-deep-blue (default)
     Neon                  — magenta / cyan synthwave
     Space                 — deep cosmic blue / amethyst
-    Glass                 — Apple-inspired frosted translucent layering
+    Liquid Glass          — Apple-inspired frosted translucent layering
     Light (WinSCP)        — clean grey/white panels, soft blue accent
+    OG Black              — pure black, no glow, maximum readability
+    Retro Terminal        — classic green-on-black CRT aesthetic
 """
 
 from __future__ import annotations
@@ -183,40 +185,44 @@ SPACE = Theme(
     accent2_dim= "#2a8c6f",
 )
 
-# Glass — Apple-inspired translucent theme.
+# Liquid Glass — Windows-Terminal-style transparent theme.
 #
-# Qt/QSS cannot do real backdrop blur on arbitrary widgets, so "glass"
-# is simulated with layered semi-transparent fills over a deep gradient
-# base. `bg_deep` is the solid backdrop painted behind everything; the
-# other surfaces sit above it with rgba alpha channels to produce soft
-# layered depth. Text colors stay fully opaque for readability.
-GLASS = Theme(
-    name="Glass",
+# All surfaces use solid colours — the glass effect comes from
+# ``setWindowOpacity`` on the QMainWindow plus optional DWM Acrylic
+# blur behind the window (Windows 10+).  This avoids the broken
+# rgba-in-QSS approach where nested semi-opaque widgets stack to
+# near-opaque and the transparency slider has no visible effect.
+#
+# The palette is a dark navy — similar to Dark but cooler/bluer — so
+# the window still reads as a premium dark app even when transparency
+# is turned off.
+LIQUID_GLASS = Theme(
+    name="Liquid Glass",
     is_dark=True,
-    bg_deep    = "#0a1220",                # solid gradient backdrop (see QSS)
-    bg_base    = "rgba(18, 26, 44, 170)",  # main workspace — frosted
-    bg_raised  = "rgba(30, 42, 66, 185)",  # cards, headers
-    bg_hover   = "rgba(60, 84, 128, 160)", # hover wash
-    bg_select  = "rgba(80, 140, 220, 130)",# selection highlight
-    bg_input   = "rgba(12, 20, 36, 195)",  # inputs — slightly denser
-    border     = "rgba(255, 255, 255, 32)",
-    border_lt  = "rgba(255, 255, 255, 64)",
+    bg_deep    = "#0a1220",
+    bg_base    = "#0f1a2c",
+    bg_raised  = "#162438",
+    bg_hover   = "#1e3050",
+    bg_select  = "#1a3a5c",
+    bg_input   = "#0c1628",
+    border     = "#1e3050",
+    border_lt  = "#2a4068",
     accent     = "#7fd4ff",
     accent_dim = "#4a9fd1",
-    accent_bg  = "rgba(80, 170, 240, 48)",
+    accent_bg  = "#0f2038",
     green      = "#5fe7a6",
     green_dim  = "#2c8a5c",
     amber      = "#ffc857",
     red        = "#ff6b82",
     red_dim    = "#992236",
     text       = "#f2f6ff",
-    text_dim   = "#aeb8cc",
+    text_dim   = "#8899b0",
     text_mono  = "#bfe6ff",
     white      = "#ffffff",
     term_bg    = "#0a1220",
     term_fg    = "#d9efff",
     term_glow  = "#7fd4ff",
-    term_border= "rgba(127, 212, 255, 90)",
+    term_border= "#1e3050",
     accent2    = "#bd9bff",
     accent2_dim= "#7858bd",
 )
@@ -268,41 +274,128 @@ LIGHT = Theme(
     accent2_dim= "#104a7e",
 )
 
-BUILT_IN_THEMES: list[Theme] = [DARK, NEON, SPACE, GLASS, LIGHT]
+# ── OG Black accent presets ──────────────────────────────────────────────────
+#
+# OG Black is a theme *family*: the surfaces are always true-black, but
+# the user picks an accent colour from a fixed palette. The five-tuple
+# is (accent, accent_dim, accent_bg, accent2, accent2_dim).
+
+OG_BLACK_ACCENTS: dict[str, tuple[str, str, str, str, str]] = {
+    "Blue":   ("#4a9eff", "#2d6fc0", "#0d1a2e", "#6ab4ff", "#3a7acc"),
+    "Cyan":   ("#22d3ee", "#0891b2", "#051e26", "#67e8f9", "#06b6d4"),
+    "Orange": ("#f97316", "#c2410c", "#261004", "#fb923c", "#9a3412"),
+    "Green":  ("#22c55e", "#15803d", "#052e16", "#4ade80", "#166534"),
+    "Purple": ("#a855f7", "#7c3aed", "#1a0a30", "#c084fc", "#6d28d9"),
+    "Red":    ("#ef4444", "#b91c1c", "#250606", "#f87171", "#991b1b"),
+}
+
+
+def _build_og_black(accent_name: str = "Blue") -> Theme:
+    """Build an OG Black theme with the chosen accent colour."""
+    a = OG_BLACK_ACCENTS.get(accent_name, OG_BLACK_ACCENTS["Blue"])
+    accent, accent_dim, accent_bg, accent2, accent2_dim = a
+    return Theme(
+        name="OG Black",
+        is_dark=True,
+        bg_deep    = "#000000",
+        bg_base    = "#0c0c0c",
+        bg_raised  = "#1a1a1a",
+        bg_hover   = "#262626",
+        bg_select  = accent_bg,
+        bg_input   = "#111111",
+        border     = "#2e2e2e",
+        border_lt  = "#404040",
+        accent     = accent,
+        accent_dim = accent_dim,
+        accent_bg  = accent_bg,
+        green      = "#4caf50",
+        green_dim  = "#2e7d32",
+        amber      = "#ff9800",
+        red        = "#ef4444",
+        red_dim    = "#b91c1c",
+        text       = "#e8e8e8",
+        text_dim   = "#808080",
+        text_mono  = "#b0b8c0",
+        white      = "#ffffff",
+        term_bg    = "#000000",
+        term_fg    = "#cccccc",
+        term_glow  = accent,
+        term_border= "#333333",
+        accent2    = accent2,
+        accent2_dim= accent2_dim,
+    )
+
+
+OG_BLACK = _build_og_black("Blue")
+
+# Retro Terminal — classic green-on-black CRT aesthetic.
+#
+# Every UI surface is a shade of deep green-black, every text element
+# is phosphor green, and the accent is the classic terminal green
+# (#00ff41). The QSS builder overrides the body font to monospace so
+# the entire application reads like a terminal session.
+RETRO = Theme(
+    name="Retro Terminal",
+    is_dark=True,
+    bg_deep    = "#000000",
+    bg_base    = "#020a02",
+    bg_raised  = "#071407",
+    bg_hover   = "#0d220d",
+    bg_select  = "#0a3a0a",
+    bg_input   = "#010801",
+    border     = "#0a3a0a",
+    border_lt  = "#0f5a0f",
+    accent     = "#00ff41",
+    accent_dim = "#00aa2a",
+    accent_bg  = "#021a02",
+    green      = "#00ff41",
+    green_dim  = "#00aa2a",
+    amber      = "#cccc00",
+    red        = "#ff2020",
+    red_dim    = "#881010",
+    text       = "#33ff77",
+    text_dim   = "#1a8844",
+    text_mono  = "#55ff88",
+    white      = "#ffffff",
+    term_bg    = "#000000",
+    term_fg    = "#00ff41",
+    term_glow  = "#00ff41",
+    term_border= "#0a3a0a",
+    accent2    = "#55ff88",
+    accent2_dim= "#228844",
+)
+
+BUILT_IN_THEMES: list[Theme] = [
+    DARK, NEON, SPACE, LIQUID_GLASS, LIGHT, OG_BLACK, RETRO,
+]
 
 
 # ── QSS builder ───────────────────────────────────────────────────────────────
 
 def build_qss(t: Theme) -> str:
-    """Compile the application stylesheet from a theme palette."""
-    # Glass theme paints a soft diagonal gradient on the root window so
-    # the rgba `bg_base` surfaces layer over it and produce a frosted
-    # depth effect. Other themes stay on a flat `bg_deep`.
-    if t.name == "Glass":
+    """Compile the application stylesheet from a theme palette.
+
+    All surfaces are fully opaque.  The Liquid Glass transparency
+    effect is applied at the *window* level via ``setWindowOpacity``
+    (+ optional DWM Acrylic on Windows), so QSS never touches alpha.
+    """
+    # ── Per-theme surfaces ───────────────────────────────────────────
+    if t.name == "Liquid Glass":
         root_bg = (
             "qlineargradient(x1:0, y1:0, x2:1, y2:1, "
             "stop:0 #0b1426, stop:0.5 #122037, stop:1 #0a1a2d)"
         )
-        # Sidebar / menu / status share a darker frosted layer so they
-        # clearly sit behind the workspace cards.
-        sidebar_bg  = "rgba(10, 16, 30, 205)"
-        menubar_bg  = "rgba(12, 20, 36, 210)"
-        statusbar_bg = "rgba(10, 16, 30, 215)"
-        toolbar_bg = (
-            "qlineargradient(x1:0, y1:0, x2:0, y2:1, "
-            "stop:0 rgba(28, 40, 64, 200), stop:1 rgba(18, 28, 48, 200))"
-        )
-        raised_bg = (
-            "qlineargradient(x1:0, y1:0, x2:0, y2:1, "
-            "stop:0 rgba(34, 48, 76, 195), stop:1 rgba(24, 36, 58, 190))"
-        )
     else:
         root_bg = t.bg_deep
-        sidebar_bg  = t.bg_deep
-        menubar_bg  = t.bg_deep
-        statusbar_bg = t.bg_deep
-        # Subtle vertical gradient on raised surfaces — gives the UI a
-        # touch of depth without abandoning the flat technical look.
+
+    sidebar_bg   = t.bg_deep
+    menubar_bg   = t.bg_deep
+    statusbar_bg = t.bg_deep
+
+    if t.name in ("OG Black", "Retro Terminal"):
+        toolbar_bg = t.bg_raised
+        raised_bg  = t.bg_raised
+    else:
         toolbar_bg = (
             f"qlineargradient(x1:0, y1:0, x2:0, y2:1, "
             f"stop:0 {t.bg_raised}, stop:1 {t.bg_base})"
@@ -312,15 +405,17 @@ def build_qss(t: Theme) -> str:
             f"stop:0 {t.bg_hover}, stop:1 {t.bg_raised})"
         )
 
-    # Typography — single font stack used for every "engineered" piece
-    # of UI text (nav, tabs, headers, status, terminal-adjacent labels)
-    # so the whole app shares one technical voice. Body text stays on
-    # Segoe UI for maximum readability.
+    # Typography — Retro Terminal uses monospace for EVERYTHING so the
+    # whole application reads like a terminal session. Other themes keep
+    # a proportional body font for readability.
     MONO = (
         "'JetBrains Mono', 'Cascadia Mono', 'Cascadia Code', "
         "'Fira Code', 'Consolas', 'Courier New', monospace"
     )
-    SANS = "'Segoe UI', 'Inter', Arial, sans-serif"
+    if t.name == "Retro Terminal":
+        SANS = MONO
+    else:
+        SANS = "'Segoe UI', 'Inter', Arial, sans-serif"
 
     # Secondary accent — falls back to the primary accent so legacy
     # themes that haven't defined accent2 still render correctly.
@@ -843,6 +938,15 @@ QTabBar::tab:hover:!selected {{
     color: {t.text};
     border-color: {t.border_lt};
 }}
+/* Tab close button — minimal, theme-matching. */
+QTabBar::close-button {{
+    subcontrol-position: right;
+    padding: 4px;
+}}
+QTabBar::close-button:hover {{
+    background: {t.bg_hover};
+    border-radius: 3px;
+}}
 
 /* ── Menu ─────────────────────────────────────────────────────── */
 QMenuBar {{
@@ -922,10 +1026,19 @@ QPlainTextEdit, QTextEdit {{
 """
 
 
-# ── Theme manager (singleton) ─────────────────────────────────────────────────
+# ── Theme manager (singleton) ────────────────────────────────────────────────
 
 class ThemeManager(QObject):
-    """Holds the active Theme and notifies listeners on change."""
+    """Holds the active Theme and notifies listeners on change.
+
+    Window-level effects
+    --------------------
+    Liquid Glass uses ``setWindowOpacity`` on every QMainWindow so the
+    desktop is visible through the app (like Windows Terminal's
+    *opacity* knob). On Windows 10+ it also tries DWM Acrylic to blur
+    the content behind the window. All QSS backgrounds stay fully
+    opaque — only the window compositing layer is transparent.
+    """
 
     theme_changed = pyqtSignal(object)   # Theme
 
@@ -936,6 +1049,8 @@ class ThemeManager(QObject):
         self._themes: dict[str, Theme] = {t.name: t for t in BUILT_IN_THEMES}
         self._current: Theme = DARK
         self._app: Optional[QApplication] = None
+        self._glass_opacity: int = 88      # 60–100 → maps to setWindowOpacity
+        self._og_accent: str = "Blue"
 
     # singleton accessor ------------------------------------------------------
 
@@ -964,12 +1079,61 @@ class ThemeManager(QObject):
         self._current = self._themes[name]
         self._apply()
         self.theme_changed.emit(self._current)
+        # Window effects must run after the signal handlers finish —
+        # some handlers re-polish widgets which can reset opacity.
+        self._apply_window_effects()
+
+    @property
+    def glass_opacity(self) -> int:
+        return self._glass_opacity
+
+    def set_glass_opacity(self, value: int) -> None:
+        value = max(60, min(100, value))
+        if value == self._glass_opacity:
+            return
+        self._glass_opacity = value
+        self._apply_window_effects()
+
+    @property
+    def og_accent(self) -> str:
+        return self._og_accent
+
+    def set_og_accent(self, name: str) -> None:
+        if name not in OG_BLACK_ACCENTS or name == self._og_accent:
+            return
+        self._og_accent = name
+        new = _build_og_black(name)
+        self._themes["OG Black"] = new
+        if self._current.name == "OG Black":
+            self._current = new
+            self._apply()
+            self.theme_changed.emit(self._current)
 
     # internal ----------------------------------------------------------------
 
     def _apply(self):
         if self._app is not None:
             self._app.setStyleSheet(build_qss(self._current))
+            # Qt's stylesheet polish pass resets windowOpacity.
+            # A deferred re-apply after 150 ms lets the polish
+            # (and all theme_changed signal handlers) finish first.
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(150, self._apply_window_effects)
+
+    def _apply_window_effects(self) -> None:
+        """Apply window-level opacity for Liquid Glass."""
+        if self._app is None:
+            return
+        from PyQt6.QtWidgets import QMainWindow
+        is_glass = self._current.name == "Liquid Glass"
+        opacity = self._glass_opacity / 100.0 if is_glass else 1.0
+        for w in self._app.topLevelWidgets():
+            if not isinstance(w, QMainWindow):
+                continue
+            try:
+                w.setWindowOpacity(opacity)
+            except Exception:
+                pass
 
 
 def theme() -> Theme:

@@ -16,7 +16,10 @@ os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
 # Make the project root importable regardless of the working directory.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# When frozen (PyInstaller), all modules are already bundled and this
+# would only confuse the import system by pointing at _MEIPASS.
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
@@ -24,7 +27,8 @@ from PyQt6.QtGui import QFont
 
 from gui.themes import ThemeManager
 from gui.main_window import MainWindow
-from gui.motion import install_global_motion
+from gui.motion import install_global_motion, fade_in
+from gui.components.loading_screen import LoadingScreen
 from utils import settings
 
 
@@ -48,18 +52,41 @@ def main() -> int:
     app.setFont(QFont("Segoe UI", 10))
 
     # Attach theme manager → applies the active stylesheet.
-    ThemeManager.instance().attach(app)
+    tm = ThemeManager.instance()
+    tm.set_glass_opacity(settings.get("glass_opacity", 88))
+    tm.set_og_accent(settings.get("og_accent", "Blue"))
+    tm.attach(app)
     saved = settings.get("theme", "Dark")
-    if saved in ThemeManager.instance().theme_names():
-        ThemeManager.instance().set_theme(saved)
+    if saved in tm.theme_names():
+        tm.set_theme(saved)
 
+    # Construct the main window up-front but keep it hidden. We show
+    # the boot-sequence splash first, then hand off to the main window
+    # once the splash finishes — no blocking sleeps, no flicker.
     window = MainWindow()
-    window.show()
 
     # Install the global motion / interaction system AFTER the main
     # window is constructed so the initial sweep finds every control.
     # Future widgets are picked up by the watcher's first-show filter.
     install_global_motion(app)
+
+    splash = LoadingScreen()
+
+    def _reveal_main_window():
+        # Show the main window behind the still-visible splash, then
+        # fade the splash out; cross-fade gives a premium handoff.
+        window.show()
+        window.raise_()
+        try:
+            fade_in(window, duration=300)
+        except Exception:
+            # fade_in is a best-effort premium touch; never let a
+            # missing dependency block the app from appearing.
+            pass
+        splash.start_fade_out()
+
+    splash.finished.connect(_reveal_main_window)
+    splash.show()
 
     return app.exec()
 

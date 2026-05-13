@@ -16,7 +16,24 @@
       "Bash(PYTHONIOENCODING=utf-8 python -u tests/crash_harness.py)",
       "Bash(echo \"EXIT=$?\")",
       "Bash(timeout 120 python -u tests/crash_harness.py)",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(python tests/_smoke_loading.py)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(python -c \"print\\('a'\\); import sys; print\\(sys.version\\)\")",
+      "Bash(echo \"rc=$?\")",
+      "Bash(find *)",
+      "Bash(QT_QPA_PLATFORM=offscreen python -c \"from PyQt6.QtWidgets import QApplication; app = QApplication\\([]\\); from gui.main_window import MainWindow; w = MainWindow\\(\\); print\\('OK stack count', w._stack.count\\(\\)\\)\")",
+      "Bash(QT_QPA_PLATFORM=offscreen python tests/_smoke_ui.py)",
+      "Bash(PYTHONPATH=\".\" QT_QPA_PLATFORM=offscreen python tests/_smoke_ui.py)",
+      "Bash(PYTHONPATH=\".\" QT_QPA_PLATFORM=offscreen python tests/_smoke_socials.py)",
+      "Bash(pip --version)",
+      "Bash(./NetEngine.exe)",
+      "Bash(tasklist //FI \"IMAGENAME eq NetEngine.exe\")",
+      "Bash(taskkill //IM NetEngine.exe //F)",
+      "Bash(set NETENGINE_SSH_DEBUG=1)",
+      "Bash(grep -E \"^\\(TERMINAL|\\\\\\\\s\\\\\\\\s\\\\\\\\[FAIL\\)\")",
+      "Bash(grep -E \"^\\(SSH LOOPBACK|\\\\\\\\s\\\\\\\\s\\\\\\\\[FAIL\\)\")",
+      "Bash(grep -E \"^\\(SSH SESSION|\\\\\\\\s\\\\\\\\s\\\\\\\\[FAIL\\)\")"
     ]
   }
 }

@@ -70,6 +70,7 @@ from ai.ai_service import (
 from ai.command_assistant import parse_command_response, CommandSuggestion
 from ai.ollama_client import ModelInfo
 from gui.themes import theme, ThemeManager
+from utils.clipboard import copy_text
 
 
 # ── Small helpers ──────────────────────────────────────────────────────────
@@ -981,19 +982,9 @@ class AssistantView(QWidget):
         cmd = self._cmd_line.text().strip()
         if not cmd:
             return
+        ok = copy_text(cmd)
         try:
-            QApplication.clipboard().setText(cmd)
-        except Exception:
-            # Clipboard access can fail on headless / locked sessions
-            # — don't let it crash the panel.
-            try:
-                self._lbl_copy_state.setText("copy failed")
-            except RuntimeError:
-                return
-            QTimer.singleShot(1500, self._clear_copy_state_later)
-            return
-        try:
-            self._lbl_copy_state.setText("copied")
+            self._lbl_copy_state.setText("copied" if ok else "copy failed")
         except RuntimeError:
             return
         QTimer.singleShot(1500, self._clear_copy_state_later)

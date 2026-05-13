@@ -38,7 +38,10 @@ from gui.motion import MOTION, fade_in
 
 # Per-page monogram used in compact mode. The list is indexed by the
 # same order as PAGE_LABELS in main_window.
-PAGE_MONOGRAMS: list[str] = ["SC", "TM", "SH", "FT", "AD", "MO", "TL", "API", "AI"]
+PAGE_MONOGRAMS: list[str] = [
+    "SC", "TM", "SH", "FT", "AD", "MO", "TL", "API", "AI",
+    "SET", "?", "i",
+]
 
 
 class BrandHeader(QWidget):

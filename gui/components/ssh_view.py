@@ -44,9 +44,9 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QLineEdit, QFileDialog, QMessageBox,
     QGroupBox, QSplitter, QTabWidget, QFrame, QSizePolicy, QLayout,
     QScrollArea, QInputDialog, QCheckBox, QTabBar, QStackedWidget,
-    QToolButton,
+    QToolButton, QComboBox,
 )
-from PyQt6.QtGui import QIcon, QColor, QIntValidator, QShortcut, QKeySequence
+from PyQt6.QtGui import QColor, QIcon, QIntValidator, QKeySequence, QShortcut
 
 from gui.components.collapsible import CollapsibleSection
 from gui.components.live_widgets import StatusDot
@@ -56,6 +56,12 @@ from gui.components.ssh_session_tab import (
 )
 from gui.themes import theme, ThemeManager
 from scanner.ssh_client import SSHProfile, HAS_PARAMIKO
+from scanner.serial_client import (
+    SerialProfile, HAS_PYSERIAL,
+    BAUD_PRESETS, DATA_BITS_OPTIONS, STOP_BITS_OPTIONS,
+    PARITY_OPTIONS, FLOW_OPTIONS, LINE_ENDINGS,
+    list_serial_ports,
+)
 from utils import settings
 
 
@@ -76,14 +82,24 @@ class SSHView(QWidget):
     sessions_changed = pyqtSignal()
 
     # Layout constants for the connection form (centralised so every
-    # row reads the same numbers).
-    _ROW_HEIGHT     = 40
-    _LABEL_COL_W    = 60
-    _ROW_VSPACING   = 14
-    _GROUP_PAD_X    = 18
+    # row reads the same numbers). Bumped on the 2026-04 stabilization
+    # pass — old defaults left the Serial form's COM-port combo and
+    # baud row visibly clipped on a 360-px-wide panel.
+    _ROW_HEIGHT     = 36
+    _LABEL_COL_W    = 72
+    _ROW_VSPACING   = 12
+    _GROUP_PAD_X    = 16
     _GROUP_PAD_TOP  = 16
     _GROUP_PAD_BOT  = 16
-    _ACTION_BTN_H   = 48
+    _ACTION_BTN_H   = 44
+
+    # Minimum / preferred / maximum widths for the left manager panel.
+    # Wide enough that "Local echo" labels, "RTS/CTS" combo entries,
+    # and a typical USB-serial device label all fit at the smallest
+    # size without truncation.
+    _LEFT_MIN_W     = 380
+    _LEFT_MAX_W     = 560
+    _LEFT_PREF_W    = 420
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -150,7 +166,7 @@ class SSHView(QWidget):
         self._splitter.addWidget(self._build_right_panel())
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
-        self._splitter.setSizes([360, 900])
+        self._splitter.setSizes([self._LEFT_PREF_W, 900])
 
         root.addWidget(self._splitter)
 
@@ -165,14 +181,16 @@ class SSHView(QWidget):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setMinimumWidth(340)
-        scroll.setMaximumWidth(520)
+        scroll.setMinimumWidth(self._LEFT_MIN_W)
+        scroll.setMaximumWidth(self._LEFT_MAX_W)
 
         container = QWidget()
         container.setObjectName("ssh_left_container")
         lay = QVBoxLayout(container)
-        lay.setContentsMargins(4, 4, 18, 4)
-        lay.setSpacing(14)
+        # Slightly less aggressive right padding so the form has more
+        # horizontal room for combos at the smallest panel width.
+        lay.setContentsMargins(6, 6, 12, 6)
+        lay.setSpacing(12)
 
         # ── Manager header: section title + collapse toggle ──────────────
         header_row = QHBoxLayout()
@@ -265,11 +283,14 @@ class SSHView(QWidget):
             self.status_message.emit("SSH workspace expanded")
         else:
             self._left_stack.setCurrentIndex(0)
-            self._left_stack.setMinimumWidth(340)
-            self._left_stack.setMaximumWidth(520)
+            self._left_stack.setMinimumWidth(self._LEFT_MIN_W)
+            self._left_stack.setMaximumWidth(self._LEFT_MAX_W)
             # Clamp to a sensible range of the total width so narrow
             # laptop windows still give the terminal enough room.
-            target = min(max(340, int(total * 0.32)), 460)
+            target = min(
+                max(self._LEFT_MIN_W, int(total * 0.32)),
+                self._LEFT_MAX_W,
+            )
             self._splitter.setSizes([target, max(total - target, 480)])
             self.status_message.emit("Connection manager restored")
 
@@ -444,8 +465,61 @@ class SSHView(QWidget):
         body.setSpacing(self._ROW_VSPACING)
         body.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
+        # ── Connection-type toggle ───────────────────────────────────────
+        # A small header at the top of the form switches the rest of the
+        # field set between SSH (host/port/user/pass/key) and Serial /
+        # UART (port/baud/parity/etc.). The Name field is shared so a
+        # saved profile of either kind can be given a friendly label.
+        self._cmb_type = QComboBox()
+        self._cmb_type.addItem("SSH",    "ssh")
+        self._cmb_type.addItem("Serial", "serial")
+        self._cmb_type.setMinimumHeight(self._ROW_HEIGHT)
+        self._cmb_type.currentIndexChanged.connect(self._on_type_changed)
+        body.addLayout(self._make_form_row("Type", self._cmb_type))
+
         # Build inputs
         self._in_name = self._make_line_edit("Friendly name (optional)")
+        body.addLayout(self._make_form_row("Name", self._in_name))
+
+        # Stack the SSH form and the Serial form. Switching the type
+        # combobox flips the stack to whichever form is relevant —
+        # neither layout fights for space when hidden.
+        self._form_stack = QStackedWidget()
+        self._form_stack.setObjectName("ssh_form_stack")
+        self._form_stack.addWidget(self._build_ssh_form())     # idx 0
+        self._form_stack.addWidget(self._build_serial_form())  # idx 1
+        body.addWidget(self._form_stack)
+
+        body.addSpacing(8)
+        body.addLayout(self._build_action_row())
+
+        section.set_content_layout(body)
+        return section
+
+    def _current_kind(self) -> str:
+        """Return the selected connection type — 'ssh' or 'serial'."""
+        try:
+            data = self._cmb_type.currentData()
+        except RuntimeError:
+            return "ssh"
+        return str(data or "ssh")
+
+    def _on_type_changed(self, _idx: int) -> None:
+        kind = self._current_kind()
+        self._form_stack.setCurrentIndex(0 if kind == "ssh" else 1)
+        # Refresh COM port enumeration the first time Serial is shown
+        # so the dropdown isn't blank when the user lands on it.
+        if kind == "serial":
+            self._refresh_serial_ports()
+
+    # ── SSH form ─────────────────────────────────────────────────────────────
+
+    def _build_ssh_form(self) -> QWidget:
+        wrap = QWidget()
+        wrap.setObjectName("ssh_form_ssh")
+        body = QVBoxLayout(wrap)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(self._ROW_VSPACING)
 
         self._in_host = self._make_line_edit("hostname or IP")
 
@@ -503,7 +577,6 @@ class SSHView(QWidget):
         key_field.addWidget(self._in_key, 1)
         key_field.addWidget(self._btn_browse, 0)
 
-        body.addLayout(self._make_form_row("Name", self._in_name))
         body.addLayout(self._make_form_row("Host", self._in_host))
         body.addLayout(self._make_form_row("Port", port_field))
         body.addLayout(self._make_form_row("User", self._in_user))
@@ -516,11 +589,427 @@ class SSHView(QWidget):
         body.addSpacing(4)
         body.addWidget(self._chk_save_creds)
 
-        body.addSpacing(8)
-        body.addLayout(self._build_action_row())
+        return wrap
 
-        section.set_content_layout(body)
-        return section
+    # ── Serial form ──────────────────────────────────────────────────────────
+
+    def _build_serial_form(self) -> QWidget:
+        """
+        Serial / UART form.
+
+        Layout is split into two zones:
+
+          * **Essentials** — Port (with Refresh), Baud, Enter line
+            ending, Local echo. These are the only fields a typical
+            UART console / AT-command session ever needs to touch.
+
+          * **Advanced settings** — Data bits, Stop bits, Parity, Flow
+            control. Tucked behind a collapsed toggle so the form looks
+            clean for the 99% case (8-N-1, no flow control). The
+            advanced widgets are still constructed eagerly so saved-
+            session loading + ``_serial_profile_from_form`` always have
+            them available regardless of whether the user has expanded
+            the section.
+        """
+        wrap = QWidget()
+        wrap.setObjectName("ssh_form_serial")
+        body = QVBoxLayout(wrap)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(self._ROW_VSPACING)
+
+        # ── Port selector ───────────────────────────────────────────────
+        # Editable combobox so the user can paste a name pyserial didn't
+        # enumerate (rare but happens with virtual COM-port drivers on
+        # Windows). Refresh button on the right re-runs
+        # list_serial_ports().
+        self._cmb_serial_port = QComboBox()
+        self._cmb_serial_port.setEditable(True)
+        self._cmb_serial_port.setMinimumHeight(self._ROW_HEIGHT)
+        self._cmb_serial_port.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._cmb_serial_port.lineEdit().setPlaceholderText(
+            "COM3 / /dev/ttyUSB0"
+        )
+        # Reserve enough character width that short port names always
+        # render fully even with the panel at its minimum size.
+        self._cmb_serial_port.setMinimumContentsLength(14)
+        # Let the dropdown popup grow wider than the field so long
+        # USB-serial device descriptions are readable.
+        try:
+            from PyQt6.QtWidgets import QSizePolicy as _SP
+            self._cmb_serial_port.view().setMinimumWidth(360)
+            self._cmb_serial_port.view().setSizePolicy(
+                _SP.Policy.Expanding, _SP.Policy.Preferred
+            )
+        except Exception:
+            pass
+        self._cmb_serial_port.setToolTip(
+            "COM port to open (type a name if not listed)"
+        )
+        # When the user picks an item from the dropdown, swap the line
+        # edit text to the raw device name (e.g. "COM3") instead of the
+        # descriptive label ("COM3 — Silicon Labs CP210x USB to UART
+        # Bridge"). Without this, pyserial would try to open the
+        # literal label string and fail with FileNotFoundError — the
+        # exact symptom this rework is fixing. Selection by index is
+        # the dropdown-pick signal; ``editTextChanged`` would also fire
+        # but that's the user typing, which we leave alone.
+        self._cmb_serial_port.activated.connect(
+            self._on_serial_port_picked
+        )
+        self._cmb_serial_port.editTextChanged.connect(
+            lambda _t: self._update_serial_port_hint()
+        )
+
+        self._btn_serial_refresh = QPushButton("Refresh")
+        self._btn_serial_refresh.setObjectName("btn_action")
+        self._btn_serial_refresh.setFixedHeight(self._ROW_HEIGHT)
+        # Slimmer than the SSH "Browse" button so the COM combo always
+        # has visible-text width even on the smallest panel size.
+        self._btn_serial_refresh.setFixedWidth(74)
+        self._btn_serial_refresh.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        self._btn_serial_refresh.setToolTip("Re-enumerate available COM ports")
+        self._btn_serial_refresh.clicked.connect(self._refresh_serial_ports)
+
+        port_field = QHBoxLayout()
+        port_field.setContentsMargins(0, 0, 0, 0)
+        port_field.setSpacing(8)
+        port_field.addWidget(self._cmb_serial_port, 1)
+        port_field.addWidget(self._btn_serial_refresh, 0)
+
+        # ── Baud (essential) ────────────────────────────────────────────
+        # Editable so non-standard baud rates work.
+        self._cmb_baud = QComboBox()
+        self._cmb_baud.setEditable(True)
+        self._cmb_baud.setMinimumHeight(self._ROW_HEIGHT)
+        self._cmb_baud.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._cmb_baud.setMinimumContentsLength(8)
+        for rate in BAUD_PRESETS:
+            self._cmb_baud.addItem(str(rate), rate)
+        self._cmb_baud.setCurrentText("115200")
+        self._cmb_baud.lineEdit().setValidator(QIntValidator(1, 4_000_000))
+
+        # ── Line ending (essential) ─────────────────────────────────────
+        # What Enter sends. Default CRLF for serial — AT-command devices
+        # and most UART consoles expect CRLF; users with bare-LF Linux
+        # consoles can switch to LF.
+        self._cmb_ending = QComboBox()
+        self._cmb_ending.setMinimumHeight(self._ROW_HEIGHT)
+        self._cmb_ending.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        ending_labels = {"cr": "CR (\\r)", "lf": "LF (\\n)", "crlf": "CRLF (\\r\\n)"}
+        for e in LINE_ENDINGS:
+            self._cmb_ending.addItem(ending_labels.get(e, e), e)
+        self._cmb_ending.setCurrentText(ending_labels["crlf"])
+
+        # ── Local echo (essential) ──────────────────────────────────────
+        # Off by default; many UART consoles echo already, so forcing
+        # this on would double every keystroke. Toggle on for AT-command
+        # modems that don't echo.
+        self._chk_local_echo = QCheckBox("Local echo (show typed characters)")
+        self._chk_local_echo.setChecked(False)
+
+        # ── Advanced widgets (built but not displayed yet) ──────────────
+        # These four are device-specific and almost always 8/1/None/None
+        # for typical UART work. Hide behind the Advanced toggle so the
+        # form looks clean for the common case.
+        # All advanced combos use Expanding horizontal policy so the
+        # parent form-row layout stretches them to fill available
+        # width, matching the SSH form's behaviour and preventing
+        # short combos from looking awkwardly narrow.
+        _adv_pol = (QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        self._cmb_data = QComboBox()
+        self._cmb_data.setMinimumHeight(self._ROW_HEIGHT)
+        self._cmb_data.setSizePolicy(*_adv_pol)
+        for bits in DATA_BITS_OPTIONS:
+            self._cmb_data.addItem(str(bits), bits)
+        self._cmb_data.setCurrentText("8")
+
+        self._cmb_stop = QComboBox()
+        self._cmb_stop.setMinimumHeight(self._ROW_HEIGHT)
+        self._cmb_stop.setSizePolicy(*_adv_pol)
+        for sb in STOP_BITS_OPTIONS:
+            label = "1" if sb == 1.0 else ("1.5" if abs(sb - 1.5) < 0.01 else "2")
+            self._cmb_stop.addItem(label, sb)
+        self._cmb_stop.setCurrentText("1")
+
+        self._cmb_parity = QComboBox()
+        self._cmb_parity.setMinimumHeight(self._ROW_HEIGHT)
+        self._cmb_parity.setSizePolicy(*_adv_pol)
+        for p in PARITY_OPTIONS:
+            self._cmb_parity.addItem(p.title(), p)
+        self._cmb_parity.setCurrentText("None")
+
+        self._cmb_flow = QComboBox()
+        self._cmb_flow.setMinimumHeight(self._ROW_HEIGHT)
+        self._cmb_flow.setSizePolicy(*_adv_pol)
+        flow_labels = {
+            "none": "None",
+            "rts_cts": "RTS/CTS",
+            "xon_xoff": "XON/XOFF",
+            "dsr_dtr": "DSR/DTR",
+        }
+        for f in FLOW_OPTIONS:
+            self._cmb_flow.addItem(flow_labels.get(f, f), f)
+        self._cmb_flow.setCurrentText("None")
+
+        # ── Description hint shown under the Port row ───────────────────
+        # PuTTY shows the human-readable device description ("USB-SERIAL
+        # CH340", "Silicon Labs CP210x USB to UART Bridge", …) next to
+        # the port name. We do the same so the user can confirm at a
+        # glance which physical device they're about to open. Hidden
+        # when there's no description for the current port name.
+        self._lbl_serial_hint = QLabel("")
+        self._lbl_serial_hint.setObjectName("ssh_serial_hint")
+        self._lbl_serial_hint.setWordWrap(True)
+        self._lbl_serial_hint.setVisible(False)
+
+        # ── Build essential rows ────────────────────────────────────────
+        body.addLayout(self._make_form_row("Port",   port_field))
+        body.addLayout(self._make_form_row("",       self._lbl_serial_hint))
+        body.addLayout(self._make_form_row("Baud",   self._cmb_baud))
+        body.addLayout(self._make_form_row("Enter",  self._cmb_ending))
+        body.addSpacing(2)
+        body.addWidget(self._chk_local_echo)
+
+        # ── Advanced toggle + collapsible body ──────────────────────────
+        self._btn_serial_advanced = QToolButton()
+        self._btn_serial_advanced.setObjectName("ssh_serial_adv_toggle")
+        self._btn_serial_advanced.setText("▸  Advanced settings")
+        self._btn_serial_advanced.setCheckable(True)
+        self._btn_serial_advanced.setChecked(False)
+        self._btn_serial_advanced.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_serial_advanced.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly
+        )
+        self._btn_serial_advanced.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._btn_serial_advanced.setMinimumHeight(28)
+        self._btn_serial_advanced.toggled.connect(
+            self._on_serial_advanced_toggled
+        )
+
+        self._serial_adv_body = QFrame()
+        self._serial_adv_body.setObjectName("ssh_serial_adv_body")
+        adv_lay = QVBoxLayout(self._serial_adv_body)
+        adv_lay.setContentsMargins(0, 6, 0, 0)
+        adv_lay.setSpacing(self._ROW_VSPACING)
+        adv_lay.addLayout(self._make_form_row("Data",   self._cmb_data))
+        adv_lay.addLayout(self._make_form_row("Stop",   self._cmb_stop))
+        adv_lay.addLayout(self._make_form_row("Parity", self._cmb_parity))
+        adv_lay.addLayout(self._make_form_row("Flow",   self._cmb_flow))
+        self._serial_adv_body.setVisible(False)
+
+        body.addSpacing(6)
+        body.addWidget(self._btn_serial_advanced)
+        body.addWidget(self._serial_adv_body)
+
+        # Populate the COM-port dropdown right away so the form is
+        # ready the moment the user switches the type to Serial.
+        self._refresh_serial_ports()
+
+        return wrap
+
+    def _on_serial_advanced_toggled(self, checked: bool) -> None:
+        """Show / hide the advanced serial settings block."""
+        try:
+            on = bool(checked)
+            self._serial_adv_body.setVisible(on)
+            self._btn_serial_advanced.setText(
+                "▾  Advanced settings" if on else "▸  Advanced settings"
+            )
+        except RuntimeError:
+            return
+
+    @staticmethod
+    def _normalize_port_name(text: str) -> str:
+        """
+        Strip any descriptive suffix from a possibly-decorated COM port
+        string, returning just the raw OS device name that pyserial
+        expects.
+
+        Examples:
+            "COM3"                                  -> "COM3"
+            "COM3 — Silicon Labs CP210x..."         -> "COM3"
+            "COM3 - USB Serial Device"              -> "COM3"
+            "COM3 (USB Serial Device)"              -> "COM3"
+            "/dev/ttyUSB0"                          -> "/dev/ttyUSB0"
+            "/dev/ttyUSB0 - FT232R"                 -> "/dev/ttyUSB0"
+            ""                                      -> ""
+
+        Defensive guard for the case where an old saved profile or a
+        manually-pasted decorated label would otherwise be sent to
+        pyserial verbatim.
+        """
+        text = (text or "").strip()
+        if not text:
+            return ""
+        # Em-dash separator used by SerialPortInfo.label, plus the
+        # ASCII variants for old saves and manual paste.
+        for sep in (" — ", " – ", " - ", " (", "\t"):
+            if sep in text:
+                text = text.split(sep, 1)[0].strip()
+                break
+        return text
+
+    def _serial_port_value(self) -> str:
+        """
+        Return the canonical raw port name for whatever the user has
+        in the COM dropdown right now.
+
+        Resolution order:
+          1. If currentIndex is set and itemData is a string, that data
+             value is the device name pyserial wants — use it. This
+             covers the dropdown-pick path even if the line edit was
+             never swapped (defence in depth).
+          2. Otherwise, run the line-edit text through
+             ``_normalize_port_name`` so a label-shaped string still
+             yields a clean device name.
+
+        Always returns a stripped string; empty string means no port.
+        """
+        try:
+            idx = self._cmb_serial_port.currentIndex()
+            text = (self._cmb_serial_port.currentText() or "").strip()
+        except (RuntimeError, AttributeError):
+            return ""
+        if idx is not None and idx >= 0:
+            try:
+                data = self._cmb_serial_port.itemData(idx)
+                label = self._cmb_serial_port.itemText(idx)
+            except (RuntimeError, AttributeError):
+                data, label = None, ""
+            if isinstance(data, str) and data:
+                # The user is showing this dropdown item — use its raw
+                # device name unless they typed something else after.
+                if (label or "") == text or (data or "") == text:
+                    return data.strip()
+        return self._normalize_port_name(text)
+
+    def _on_serial_port_picked(self, idx: int) -> None:
+        """
+        Slot for ``QComboBox.activated`` on the COM port dropdown.
+
+        Replaces the line-edit text with the raw device name from the
+        item's userData. Without this the line edit shows the long
+        descriptive label and ``currentText()`` would return that label
+        verbatim — pyserial would then try to open
+        "COM3 — Silicon Labs..." as a literal port name and fail.
+
+        Wrapped in defensive try/except: a torn-down combo or a
+        spurious activation index is silently ignored.
+        """
+        if idx is None or idx < 0:
+            return
+        try:
+            data = self._cmb_serial_port.itemData(idx)
+        except (RuntimeError, AttributeError):
+            return
+        if not isinstance(data, str) or not data:
+            return
+        try:
+            self._cmb_serial_port.blockSignals(True)
+            try:
+                self._cmb_serial_port.setEditText(data)
+            finally:
+                self._cmb_serial_port.blockSignals(False)
+        except (RuntimeError, AttributeError):
+            return
+        self._update_serial_port_hint()
+
+    def _update_serial_port_hint(self) -> None:
+        """
+        Show a small description hint under the port row matching the
+        currently-typed port. Mirrors PuTTY's "show device description
+        next to the COM number" UX.
+        """
+        try:
+            text = self._normalize_port_name(
+                self._cmb_serial_port.currentText() or ""
+            )
+        except (RuntimeError, AttributeError):
+            return
+        desc = ""
+        if text:
+            try:
+                for i in range(self._cmb_serial_port.count()):
+                    data = self._cmb_serial_port.itemData(i)
+                    if isinstance(data, str) and data == text:
+                        label = self._cmb_serial_port.itemText(i) or ""
+                        # SerialPortInfo.label is "device — description"
+                        # when a description exists; split on the same
+                        # em-dash separator we used to build it.
+                        for sep in (" — ", " – ", " - "):
+                            if sep in label:
+                                desc = label.split(sep, 1)[1].strip()
+                                break
+                        break
+            except (RuntimeError, AttributeError):
+                desc = ""
+        try:
+            self._lbl_serial_hint.setText(desc)
+            self._lbl_serial_hint.setVisible(bool(desc))
+        except (RuntimeError, AttributeError):
+            return
+
+    def _refresh_serial_ports(self) -> None:
+        """
+        Re-enumerate COM ports and repopulate the dropdown.
+
+        Defensive on every step so a flaky USB driver or a freshly-
+        torn-down widget can never crash the call:
+
+          * ``list_serial_ports()`` already swallows pyserial errors.
+          * Every Qt access is wrapped — a torn-down combo on shutdown
+            or theme reload is a clean early-return, never a crash.
+          * The user's currently-typed text is preserved so a refresh
+            never wipes a manual entry mid-edit.
+        """
+        try:
+            current = (self._cmb_serial_port.currentText() or "").strip()
+        except (RuntimeError, AttributeError):
+            return
+
+        try:
+            ports = list_serial_ports()
+        except Exception:
+            ports = []
+
+        try:
+            self._cmb_serial_port.blockSignals(True)
+            try:
+                self._cmb_serial_port.clear()
+                for info in ports:
+                    try:
+                        self._cmb_serial_port.addItem(info.label, info.device)
+                    except Exception:
+                        continue
+            finally:
+                self._cmb_serial_port.blockSignals(False)
+        except (RuntimeError, AttributeError):
+            return
+
+        # Restore the previously-typed value so a refresh doesn't wipe
+        # what the user was about to commit. Manual entries (devices
+        # the OS didn't enumerate) survive the refresh.
+        if current:
+            try:
+                self._cmb_serial_port.setEditText(current)
+            except (RuntimeError, AttributeError):
+                return
+
+        # Refresh the description hint after the port list rebuild so
+        # the visible description tracks whatever port the user has
+        # currently typed.
+        self._update_serial_port_hint()
 
     def _build_action_row(self) -> QHBoxLayout:
         action_row = QHBoxLayout()
@@ -670,6 +1159,7 @@ class SSHView(QWidget):
 
         # ── Tab area ─────────────────────────────────────────────────────
         self._tabs = QTabWidget()
+        self._tabs.setObjectName("ssh_tabs")
         self._tabs.setTabsClosable(True)
         self._tabs.setMovable(True)
         self._tabs.setDocumentMode(False)
@@ -811,6 +1301,13 @@ class SSHView(QWidget):
                 continue
             if not isinstance(w, SshSessionTab):
                 continue
+            # Serial tabs use the same widget class but cannot host
+            # an SFTP subsystem — keep them out of the live-session
+            # roster so File Transfer's session picker only sees SSH
+            # tabs. The SSH workspace tab bar itself is the
+            # authoritative listing for the user.
+            if getattr(w, "_is_serial", False):
+                continue
             try:
                 out.append({
                     "id":    id(w),
@@ -862,32 +1359,51 @@ class SSHView(QWidget):
 
     @staticmethod
     def _all_sessions_sorted() -> list[dict]:
-        sessions = list(settings.get_ssh_hosts())
+        # Combine SSH and Serial entries into one list. Each carries a
+        # ``kind`` tag so the rest of the saved-session machinery can
+        # route operations to the right settings bucket.
+        sessions: list[dict] = []
+        for entry in settings.get_ssh_hosts():
+            entry = dict(entry)
+            entry.setdefault("kind", "ssh")
+            sessions.append(entry)
+        for entry in settings.get_serial_hosts():
+            entry = dict(entry)
+            entry["kind"] = "serial"
+            sessions.append(entry)
         sessions.sort(
             key=lambda s: (
                 not bool(s.get("favorite")),
-                (s.get("name") or s.get("host") or "").lower(),
+                (s.get("name") or s.get("host") or s.get("port") or "").lower(),
             )
         )
         return sessions
 
     @staticmethod
     def _search_haystack(entry: dict) -> str:
-        return " ".join(str(entry.get(k, "")) for k in
-                        ("name", "host", "user", "auth_method", "port")).lower()
+        if entry.get("kind") == "serial":
+            keys = ("name", "port", "baud", "kind")
+        else:
+            keys = ("name", "host", "user", "auth_method", "port", "kind")
+        return " ".join(str(entry.get(k, "")) for k in keys).lower()
 
     @staticmethod
     def _format_session_label(entry: dict) -> str:
         star = "★ " if entry.get("favorite") else "   "
-        name = entry.get("name") or f"{entry.get('user', '')}@{entry.get('host', '')}"
+        last = entry.get("last_connected", "")
+        suffix = f"   · last {last}" if last else ""
+        if entry.get("kind") == "serial":
+            name = entry.get("name") or entry.get("port") or "serial"
+            port = entry.get("port", "—")
+            baud = entry.get("baud", "—")
+            return f"{star}{name}   [SERIAL]\n     {port} @ {baud}{suffix}"
+        name = entry.get("name") or (
+            f"{entry.get('user', '')}@{entry.get('host', '')}"
+        )
         host = entry.get("host", "")
         port = entry.get("port", 22)
         user = entry.get("user", "")
-        last = entry.get("last_connected", "")
-        suffix = ""
-        if last:
-            suffix = f"   · last {last}"
-        return f"{star}{name}\n     {user}@{host}:{port}{suffix}"
+        return f"{star}{name}   [SSH]\n     {user}@{host}:{port}{suffix}"
 
     def _on_filter_changed(self, _text: str) -> None:
         self._reload_sessions()
@@ -944,7 +1460,60 @@ class SSHView(QWidget):
             return
 
     def _populate_form_from_entry(self, entry: dict) -> None:
+        kind = entry.get("kind") or "ssh"
+        # Switch the form to the right kind first so the user can see
+        # the populated fields without an extra click.
+        target_idx = 1 if kind == "serial" else 0
+        try:
+            if self._cmb_type.currentIndex() != target_idx:
+                self._cmb_type.setCurrentIndex(target_idx)
+        except RuntimeError:
+            return
+
         self._in_name.setText(entry.get("name", ""))
+
+        if kind == "serial":
+            # Normalise on load so old saved entries that may carry a
+            # descriptive label (from before the raw-name fix) get
+            # cleaned up automatically.
+            port = self._normalize_port_name(str(entry.get("port", "") or ""))
+            self._cmb_serial_port.setEditText(port)
+            self._update_serial_port_hint()
+            try:
+                baud = int(entry.get("baud", 115200) or 115200)
+            except (TypeError, ValueError):
+                baud = 115200
+            self._cmb_baud.setEditText(str(baud))
+            data_bits = int(entry.get("data_bits", 8) or 8)
+            stop_bits = float(entry.get("stop_bits", 1.0) or 1.0)
+            parity    = str(entry.get("parity", "none") or "none")
+            flow      = str(entry.get("flow_control", "none") or "none")
+            self._select_combo_by_data(self._cmb_data,   data_bits)
+            self._select_combo_by_data(self._cmb_stop,   stop_bits)
+            self._select_combo_by_data(self._cmb_parity, parity)
+            self._select_combo_by_data(self._cmb_flow,   flow)
+            self._select_combo_by_data(
+                self._cmb_ending,
+                str(entry.get("line_ending", "crlf") or "crlf"),
+            )
+            self._chk_local_echo.setChecked(bool(entry.get("local_echo")))
+
+            # Auto-expand Advanced settings when the saved profile
+            # uses anything other than the 8-N-1 / no-flow defaults so
+            # the user can see what's loaded without an extra click.
+            try:
+                has_advanced = (
+                    data_bits != 8
+                    or abs(stop_bits - 1.0) > 0.01
+                    or parity != "none"
+                    or flow != "none"
+                )
+                self._btn_serial_advanced.setChecked(has_advanced)
+            except (RuntimeError, AttributeError):
+                pass
+            return
+
+        # SSH branch
         self._in_host.setText(entry.get("host", ""))
         self._set_port(entry.get("port", 22) or 22)
         self._in_user.setText(entry.get("user", ""))
@@ -957,16 +1526,52 @@ class SSHView(QWidget):
         self._in_key.setText(entry.get("key_path", ""))
         self._chk_save_creds.setChecked(bool(entry.get("save_credentials")))
 
+    @staticmethod
+    def _select_combo_by_data(cmb: QComboBox, value) -> None:
+        """Set ``cmb``'s current selection to the entry whose data == value."""
+        try:
+            for i in range(cmb.count()):
+                if cmb.itemData(i) == value:
+                    cmb.setCurrentIndex(i)
+                    return
+        except RuntimeError:
+            return
+
     def _on_new_session(self) -> None:
-        for w in (self._in_name, self._in_host, self._in_user,
-                  self._in_pass, self._in_key):
-            w.clear()
-        self._set_port(22)
-        self._chk_save_creds.setChecked(False)
-        self._sessions_list.clearSelection()
-        self._in_name.setFocus()
+        try:
+            self._in_name.clear()
+            for w in (self._in_host, self._in_user,
+                      self._in_pass, self._in_key):
+                w.clear()
+            self._set_port(22)
+            self._chk_save_creds.setChecked(False)
+            # Reset the Serial form to defaults too so a New press
+            # gives the user a clean slate regardless of which type
+            # was last shown.
+            self._cmb_serial_port.setEditText("")
+            self._cmb_baud.setCurrentText("115200")
+            self._select_combo_by_data(self._cmb_data, 8)
+            self._select_combo_by_data(self._cmb_stop, 1.0)
+            self._select_combo_by_data(self._cmb_parity, "none")
+            self._select_combo_by_data(self._cmb_flow, "none")
+            self._select_combo_by_data(self._cmb_ending, "crlf")
+            self._chk_local_echo.setChecked(False)
+            try:
+                self._btn_serial_advanced.setChecked(False)
+            except (RuntimeError, AttributeError):
+                pass
+            self._sessions_list.clearSelection()
+            self._in_name.setFocus()
+        except RuntimeError:
+            return
 
     def _on_save_session(self) -> None:
+        if self._current_kind() == "serial":
+            self._save_serial_session()
+        else:
+            self._save_ssh_session()
+
+    def _save_ssh_session(self) -> None:
         try:
             host = self._in_host.text().strip()
         except RuntimeError:
@@ -992,6 +1597,7 @@ class SSHView(QWidget):
                 {},
             )
             entry = {
+                "kind":     "ssh",
                 "name":     name,
                 "host":     host,
                 "port":     port,
@@ -1021,30 +1627,88 @@ class SSHView(QWidget):
         except RuntimeError:
             return
 
+    def _save_serial_session(self) -> None:
+        # Save uses the canonical raw device name, never the label —
+        # otherwise an old saved profile would carry the descriptive
+        # text and fail to open on next load.
+        try:
+            port = self._serial_port_value()
+        except RuntimeError:
+            return
+        if not port:
+            QMessageBox.warning(
+                self, "Save session", "COM / serial port is required.",
+            )
+            return
+        profile = self._serial_profile_from_form()
+        if profile is None:
+            return
+        try:
+            name = self._in_name.text().strip() or port
+            self._in_name.setText(name)
+        except RuntimeError:
+            return
+        try:
+            existing = next(
+                (s for s in settings.get_serial_hosts() if s.get("name") == name),
+                {},
+            )
+            entry = profile.to_dict()
+            entry["name"] = name
+            entry["favorite"] = existing.get("favorite", False)
+            entry["last_connected"] = existing.get("last_connected", "")
+            settings.save_serial_host(entry)
+        except Exception as exc:
+            try:
+                QMessageBox.warning(
+                    self.window() or self,
+                    "Save session",
+                    f"Could not save '{name}': {exc}",
+                )
+            except Exception:
+                pass
+            return
+        try:
+            self._reload_sessions()
+            self.status_message.emit(f"Saved Serial session '{name}'")
+        except RuntimeError:
+            return
+
     def _extract_selected_session_name(self) -> str:
         """
         Read the name of the currently-selected saved session into a
         plain Python string WITHOUT holding a long-lived
-        QListWidgetItem wrapper. The item wrapper is created
-        transiently inside this method and dropped before returning,
-        so no dangling sip wrapper survives past the call — important
-        because _reload_sessions() later calls list.clear() which
-        destroys the C++ side of every QListWidgetItem, and cleaning
-        up a dangling Python wrapper to a destroyed Qt-owned item is
-        a known segfault vector on Windows/PyQt6.
+        QListWidgetItem wrapper.
+        """
+        ident = self._extract_selected_session_ident()
+        return ident[0] if ident else ""
+
+    def _extract_selected_session_ident(self) -> tuple[str, str]:
+        """
+        Read the (name, kind) of the currently-selected saved session.
+
+        Two-tuple instead of a one-string return so delete / pin can
+        route to the right settings bucket without re-snapshotting.
+        The item wrapper is created transiently inside this method
+        and dropped before returning, so no dangling sip wrapper
+        survives past the call — important because _reload_sessions()
+        later calls list.clear() which destroys the C++ side of every
+        QListWidgetItem, and cleaning up a dangling Python wrapper to
+        a destroyed Qt-owned item is a known segfault vector on
+        Windows/PyQt6.
         """
         try:
             row = self._sessions_list.currentRow()
         except RuntimeError:
-            return ""
+            return ("", "")
         if row is None or row < 0:
-            return ""
+            return ("", "")
         try:
             item = self._sessions_list.item(row)
         except RuntimeError:
-            return ""
+            return ("", "")
         if item is None:
-            return ""
+            return ("", "")
         try:
             data = item.data(Qt.ItemDataRole.UserRole)
         except RuntimeError:
@@ -1054,8 +1718,11 @@ class SSHView(QWidget):
         # list.clear() cannot leave a dangling wrapper behind.
         item = None
         if not isinstance(data, dict):
-            return ""
-        return str(data.get("name", ""))
+            return ("", "")
+        return (
+            str(data.get("name", "")),
+            str(data.get("kind", "ssh")) or "ssh",
+        )
 
     def _on_delete_session(self) -> None:
         # Re-entry guard. QMessageBox.question spins a nested event
@@ -1066,7 +1733,7 @@ class SSHView(QWidget):
         if self._delete_in_flight:
             return
 
-        name = self._extract_selected_session_name()
+        name, kind = self._extract_selected_session_ident()
         if not name:
             return
 
@@ -1104,9 +1771,11 @@ class SSHView(QWidget):
         #     referenced on the stack above us
         # Running via QTimer.singleShot(0, ...) guarantees we're in a
         # fresh stack frame with no such ambient state.
-        QTimer.singleShot(0, lambda n=name: self._finalize_delete(n))
+        QTimer.singleShot(
+            0, lambda n=name, k=kind: self._finalize_delete(n, k)
+        )
 
-    def _finalize_delete(self, name: str) -> None:
+    def _finalize_delete(self, name: str, kind: str = "ssh") -> None:
         """
         Perform the actual persistent delete + UI refresh. Called via
         QTimer.singleShot from _on_delete_session, so it always runs
@@ -1115,7 +1784,10 @@ class SSHView(QWidget):
         if not name:
             return
         try:
-            settings.delete_ssh_host(name)
+            if (kind or "ssh") == "serial":
+                settings.delete_serial_host(name)
+            else:
+                settings.delete_ssh_host(name)
         except Exception as exc:
             try:
                 QMessageBox.warning(
@@ -1144,7 +1816,10 @@ class SSHView(QWidget):
             return
         entry["favorite"] = not bool(entry.get("favorite"))
         try:
-            settings.save_ssh_host(entry)
+            if (entry.get("kind") or "ssh") == "serial":
+                settings.save_serial_host(entry)
+            else:
+                settings.save_ssh_host(entry)
         except Exception:
             return
         # Bounce the reload + re-selection so it runs in a fresh
@@ -1184,19 +1859,32 @@ class SSHView(QWidget):
             return "password"
         return "agent"
 
-    def _record_last_connected(self, profile: SSHProfile) -> None:
-        # Update the timestamp on a saved session matching this name (if any).
-        if not profile.name:
+    def _record_last_connected(self, profile) -> None:
+        """
+        Update the timestamp on a saved session matching this profile
+        name (if any). Routes to the SSH or Serial bucket based on the
+        concrete profile type.
+        """
+        if not getattr(profile, "name", ""):
             return
+        if isinstance(profile, SerialProfile):
+            store_get = settings.get_serial_hosts
+            store_save = settings.save_serial_host
+        else:
+            store_get = settings.get_ssh_hosts
+            store_save = settings.save_ssh_host
         existing = next(
-            (s for s in settings.get_ssh_hosts() if s.get("name") == profile.name),
+            (s for s in store_get() if s.get("name") == profile.name),
             None,
         )
         if existing is None:
             return
         existing = dict(existing)
         existing["last_connected"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        settings.save_ssh_host(existing)
+        try:
+            store_save(existing)
+        except Exception:
+            return
         self._reload_sessions()
 
     # ── Connect / quick connect / duplicate ─────────────────────────────────
@@ -1267,7 +1955,19 @@ class SSHView(QWidget):
             n = 22
         self._in_port.setText(str(n))
 
-    def _profile_from_form(self) -> Optional[SSHProfile]:
+    def _profile_from_form(self):
+        """
+        Build the profile object the active form describes.
+
+        Returns an :class:`SSHProfile` or :class:`SerialProfile`
+        depending on the type combobox, or ``None`` if any required
+        field is missing or invalid (caller already saw the warning).
+        """
+        if self._current_kind() == "serial":
+            return self._serial_profile_from_form()
+        return self._ssh_profile_from_form()
+
+    def _ssh_profile_from_form(self) -> Optional[SSHProfile]:
         host = self._in_host.text().strip()
         user = self._in_user.text().strip()
         if not host:
@@ -1288,16 +1988,65 @@ class SSHView(QWidget):
             key_path=self._in_key.text().strip(),
         )
 
+    def _serial_profile_from_form(self) -> Optional[SerialProfile]:
+        # Always resolve the raw OS device name. Without this, picking
+        # "COM3 — Silicon Labs CP210x..." from the dropdown would feed
+        # the descriptive label to pyserial and the open call would
+        # fail — that's the exact bug PuTTY users would not see
+        # because PuTTY shows raw port names directly.
+        port = self._serial_port_value()
+        if not port:
+            QMessageBox.warning(self, "Serial", "COM / serial port is required.")
+            return None
+        try:
+            baud = int((self._cmb_baud.currentText() or "0").strip())
+        except ValueError:
+            QMessageBox.warning(self, "Serial", "Baud rate must be a whole number.")
+            return None
+        if baud <= 0:
+            QMessageBox.warning(
+                self, "Serial",
+                f"Baud rate must be a positive integer — got {baud}.",
+            )
+            return None
+        try:
+            data_bits = int(self._cmb_data.currentData() or 8)
+            stop_bits = float(self._cmb_stop.currentData() or 1.0)
+            parity    = str(self._cmb_parity.currentData() or "none")
+            flow      = str(self._cmb_flow.currentData() or "none")
+            ending    = str(self._cmb_ending.currentData() or "crlf")
+        except RuntimeError:
+            return None
+        return SerialProfile(
+            name=self._in_name.text().strip(),
+            port=port,
+            baud=baud,
+            data_bits=data_bits,
+            stop_bits=stop_bits,
+            parity=parity,
+            flow_control=flow,
+            line_ending=ending,
+            local_echo=bool(self._chk_local_echo.isChecked()),
+        )
+
     def _on_connect_clicked(self) -> None:
         profile = self._profile_from_form()
         if profile is None:
             return
-        if not HAS_PARAMIKO:
-            QMessageBox.critical(
-                self, "SSH unavailable",
-                "paramiko is not installed.\n\nRun: pip install paramiko"
-            )
-            return
+        if isinstance(profile, SerialProfile):
+            if not HAS_PYSERIAL:
+                QMessageBox.critical(
+                    self, "Serial unavailable",
+                    "pyserial is not installed.\n\nRun: pip install pyserial",
+                )
+                return
+        else:
+            if not HAS_PARAMIKO:
+                QMessageBox.critical(
+                    self, "SSH unavailable",
+                    "paramiko is not installed.\n\nRun: pip install paramiko",
+                )
+                return
         self._open_session_tab(profile)
 
     def _on_duplicate_clicked(self) -> None:
@@ -1366,15 +2115,17 @@ class SSHView(QWidget):
 
     # ── Tab management ──────────────────────────────────────────────────────
 
-    def _open_session_tab(self, profile: SSHProfile) -> None:
+    def _open_session_tab(self, profile) -> None:
         # Defend against any failure to construct the tab or wire it
         # up — a crash here used to take the whole window with it.
+        is_serial = isinstance(profile, SerialProfile)
+        kind_label = "Serial" if is_serial else "SSH"
         try:
             tab = SshSessionTab(profile, self)
         except Exception as exc:
             QMessageBox.critical(
-                self, "SSH",
-                f"Could not create SSH session tab:\n{exc}",
+                self, kind_label,
+                f"Could not create {kind_label} session tab:\n{exc}",
             )
             return
 
@@ -1523,9 +2274,13 @@ class SSHView(QWidget):
                 return
 
     def _on_tab_state_changed(self, tab: SshSessionTab, state: str) -> None:
+        # Every step is wrapped — this is a slot fired from a Qt signal
+        # that may dispatch during the tab's own teardown, and we never
+        # want a transient widget-destruction or attribute-mismatch to
+        # propagate up into Qt's signal dispatcher.
         try:
             idx = self._tabs.indexOf(tab)
-        except RuntimeError:
+        except (RuntimeError, AttributeError):
             return
         if idx < 0:
             return
@@ -1539,15 +2294,20 @@ class SSHView(QWidget):
         }.get(state, t.text_dim)
         try:
             self._tabs.tabBar().setTabTextColor(idx, QColor(color))
-        except RuntimeError:
+        except (RuntimeError, AttributeError):
             return
 
         # Mirror the active tab's state in the bottom-left status block.
+        # Catch *every* exception here — _mirror_active_state used to
+        # blow up with AttributeError on Serial profiles because it
+        # accessed ``profile.host`` directly, and a slot exception
+        # cascades back through Qt's dispatch chain into a hard crash
+        # on some Qt6 builds.
         try:
             if idx == self._tabs.currentIndex():
                 self._mirror_active_state(tab, state)
-        except RuntimeError:
-            return
+        except Exception:
+            pass
 
         # Notify downstream listeners (File Transfer page) that a
         # session has transitioned. Wrapped in try so a listener
@@ -1589,25 +2349,41 @@ class SSHView(QWidget):
                 return
 
     def _mirror_active_state(self, tab: SshSessionTab, state: str) -> None:
+        """
+        Reflect ``tab``'s state in the bottom-left status block.
+
+        Uses ``tab.summary_text()`` and ``tab.title_text()`` instead of
+        digging into the profile directly — those helpers already
+        branch on SSH vs Serial, so this method works for both profile
+        types without any isinstance check.
+
+        Wrapped in defensive try/except because the QLabel could be
+        torn down between a state_changed emission and our handler
+        running, and a stale Python wrapper would raise RuntimeError on
+        setText.
+        """
         t = theme()
-        if state == STATE_CONNECTED:
-            self._dot.set_active(True, color=t.green)
-            self._lbl_session_state.setText(
-                f"Connected · {tab.profile.user}@{tab.profile.host}:{tab.profile.port}"
-            )
-        elif state == STATE_CONNECTING:
-            self._dot.set_active(True, color=t.amber)
-            self._lbl_session_state.setText(
-                f"Connecting to {tab.profile.host}…"
-            )
-        elif state == STATE_FAILED:
-            self._dot.set_active(False)
-            self._dot.set_color(t.red)
-            self._lbl_session_state.setText("Connection failed")
-        else:
-            self._dot.set_active(False)
-            self._dot.set_color(t.text_dim)
-            self._lbl_session_state.setText("Disconnected")
+        try:
+            if state == STATE_CONNECTED:
+                self._dot.set_active(True, color=t.green)
+                self._lbl_session_state.setText(
+                    f"Connected · {tab.summary_text()}"
+                )
+            elif state == STATE_CONNECTING:
+                self._dot.set_active(True, color=t.amber)
+                self._lbl_session_state.setText(
+                    f"Connecting to {tab.title_text()}…"
+                )
+            elif state == STATE_FAILED:
+                self._dot.set_active(False)
+                self._dot.set_color(t.red)
+                self._lbl_session_state.setText("Connection failed")
+            else:
+                self._dot.set_active(False)
+                self._dot.set_color(t.text_dim)
+                self._lbl_session_state.setText("Disconnected")
+        except (RuntimeError, AttributeError):
+            return
 
     def _update_session_count(self) -> None:
         n = self._tabs.count()
@@ -1709,6 +2485,45 @@ class SSHView(QWidget):
         self._es_hint.setStyleSheet(
             f"color: {t.text_dim}; font-size: 12px;"
         )
+
+        # Description hint label under the COM port row.
+        try:
+            self._lbl_serial_hint.setStyleSheet(
+                f"#ssh_serial_hint {{"
+                f"  color: {t.text_dim};"
+                f"  font-size: 10px;"
+                f"  font-family: 'Consolas', monospace;"
+                f"  background: transparent;"
+                f"  padding: 0px;"
+                f"}}"
+            )
+        except (RuntimeError, AttributeError):
+            pass
+
+        # Advanced-settings toggle inside the Serial form. Plain text
+        # button with a chevron prefix; the chevron flips ▸/▾ via the
+        # toggled handler, so the QSS only needs to handle colours.
+        try:
+            self._btn_serial_advanced.setStyleSheet(
+                f"QToolButton#ssh_serial_adv_toggle {{"
+                f"  background: transparent;"
+                f"  color: {t.text_dim};"
+                f"  border: none;"
+                f"  text-align: left;"
+                f"  padding: 4px 2px;"
+                f"  font-size: 11px;"
+                f"  font-weight: 700;"
+                f"  letter-spacing: 0.6px;"
+                f"}}"
+                f"QToolButton#ssh_serial_adv_toggle:hover {{"
+                f"  color: {t.accent};"
+                f"}}"
+                f"QToolButton#ssh_serial_adv_toggle:checked {{"
+                f"  color: {t.accent};"
+                f"}}"
+            )
+        except (RuntimeError, AttributeError):
+            pass
 
         # Focus-mode corner toggle. The checked state uses the accent
         # colour so the user can tell at a glance whether the mode is

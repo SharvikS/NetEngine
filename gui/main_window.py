@@ -11,8 +11,11 @@ Pages:
     6  Tools
     7  API Console
     8  Assistant
+    9  Settings          (themes, AI, editor, terminal, general)
+    10 Help              (usage guide, workflows, FAQ, troubleshooting)
+    11 About             (product identity, website, credits)
 
-Theme switching lives in the View → Theme menu and the Settings dialog.
+Theme switching lives in the View → Theme menu and the Settings page.
 """
 
 from __future__ import annotations
@@ -38,6 +41,9 @@ from gui.components.monitor_view import MonitorView
 from gui.components.tools_view import ToolsView
 from gui.components.api_console_view import ApiConsoleView
 from gui.components.assistant_view import AssistantView
+from gui.components.settings_view import SettingsView
+from gui.components.help_view import HelpView
+from gui.components.about_view import AboutView
 from gui.components.app_status_bar import (
     AppStatusBar, LEVEL_IDLE, LEVEL_BUSY, LEVEL_OK, LEVEL_WARN, LEVEL_ERROR,
 )
@@ -54,6 +60,9 @@ PAGE_LABELS = [
     "Tools",
     "API Console",
     "Assistant",
+    "Settings",
+    "Help",
+    "About",
 ]
 
 
@@ -144,6 +153,9 @@ PAGE_MONITOR     = 5
 PAGE_TOOLS       = 6
 PAGE_API         = 7
 PAGE_ASSISTANT   = 8
+PAGE_SETTINGS    = 9
+PAGE_HELP        = 10
+PAGE_ABOUT       = 11
 
 
 class MainWindow(QMainWindow):
@@ -224,6 +236,19 @@ class MainWindow(QMainWindow):
         self._tools_view     = ToolsView()
         self._api_view       = ApiConsoleView()
         self._assistant_view = AssistantView()
+        self._settings_view  = SettingsView()
+        self._help_view      = HelpView()
+        self._about_view     = AboutView()
+
+        # Let the Settings page apply AI changes directly to the live
+        # AIService instance owned by the Assistant view. Falls back to
+        # persist-only updates if the attribute isn't available.
+        try:
+            service = getattr(self._assistant_view, "_service", None)
+            if service is not None:
+                self._settings_view.attach_ai_service(service)
+        except Exception:
+            pass
 
         self._stack.addWidget(self._scanner_view)
         self._stack.addWidget(self._terminal_view)
@@ -234,6 +259,9 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._tools_view)
         self._stack.addWidget(self._api_view)
         self._stack.addWidget(self._assistant_view)
+        self._stack.addWidget(self._settings_view)
+        self._stack.addWidget(self._help_view)
+        self._stack.addWidget(self._about_view)
 
         # Structured application status bar.
         self._status_bar = AppStatusBar(self)
@@ -260,9 +288,11 @@ class MainWindow(QMainWindow):
         act_export.triggered.connect(self._scanner_view.do_export)
         file_menu.addAction(act_export)
 
-        act_settings = QAction("&Settings…", self)
+        act_settings = QAction("&Settings", self)
         act_settings.setShortcut(QKeySequence("Ctrl+,"))
-        act_settings.triggered.connect(self._show_settings)
+        act_settings.triggered.connect(
+            lambda: self._switch_page(PAGE_SETTINGS)
+        )
         file_menu.addAction(act_settings)
 
         file_menu.addSeparator()
@@ -296,7 +326,13 @@ class MainWindow(QMainWindow):
 
         for i, label in enumerate(PAGE_LABELS):
             act = QAction(label, self)
-            act.setShortcut(QKeySequence(f"Ctrl+{i+1}"))
+            # Only first nine pages get a Ctrl+N hotkey — digits beyond
+            # 9 are awkward and collide with other shortcuts. The new
+            # utility pages (Settings / Help / About) are still one
+            # sidebar click away and have their own dedicated entry
+            # points (Ctrl+, for Settings, Help menu for Help/About).
+            if i < 9:
+                act.setShortcut(QKeySequence(f"Ctrl+{i+1}"))
             act.triggered.connect(lambda _checked, idx=i: self._switch_page(idx))
             view_menu.addAction(act)
         view_menu.addSeparator()
@@ -314,8 +350,16 @@ class MainWindow(QMainWindow):
 
         # Help
         help_menu = mb.addMenu("&Help")
+        act_help = QAction("Help && FAQ", self)
+        act_help.setShortcut(QKeySequence("F1"))
+        act_help.triggered.connect(
+            lambda: self._switch_page(PAGE_HELP)
+        )
+        help_menu.addAction(act_help)
         act_about = QAction("About Net Engine", self)
-        act_about.triggered.connect(self._show_about)
+        act_about.triggered.connect(
+            lambda: self._switch_page(PAGE_ABOUT)
+        )
         help_menu.addAction(act_about)
 
     def _wire_signals(self):
@@ -352,6 +396,9 @@ class MainWindow(QMainWindow):
             lambda t: self._status_bar.set_activity(t, LEVEL_IDLE)
         )
         self._api_view.status_message.connect(
+            lambda t: self._status_bar.set_activity(t, LEVEL_IDLE)
+        )
+        self._settings_view.status_message.connect(
             lambda t: self._status_bar.set_activity(t, LEVEL_IDLE)
         )
 
@@ -467,6 +514,9 @@ class MainWindow(QMainWindow):
             PAGE_TOOLS:     "TOOLS",
             PAGE_API:       "API",
             PAGE_ASSISTANT: "AI",
+            PAGE_SETTINGS:  "SETTINGS",
+            PAGE_HELP:      "HELP",
+            PAGE_ABOUT:     "ABOUT",
         }
         self._status_bar.set_mode(labels.get(idx, ""))
 
@@ -684,13 +734,15 @@ class MainWindow(QMainWindow):
     # ── Misc ─────────────────────────────────────────────────────────────────
 
     def _show_about(self):
-        from gui.dialogs import AboutDialog
-        AboutDialog(self).exec()
+        # Kept for backward-compat — some external callers may still
+        # invoke this. Now routes to the dedicated About page in the
+        # main stack instead of opening a modal dialog.
+        self._switch_page(PAGE_ABOUT)
 
     def _show_settings(self):
-        from gui.dialogs import SettingsDialog
-        dlg = SettingsDialog(self)
-        dlg.exec()
+        # Kept for backward-compat. Routes to the dedicated Settings
+        # page rather than opening the legacy modal dialog.
+        self._switch_page(PAGE_SETTINGS)
 
     def closeEvent(self, event):
         # Drop SSH terminal focus mode before we start tearing views
@@ -713,6 +765,7 @@ class MainWindow(QMainWindow):
             "_transfer_view", "_ssh_view",
             "_monitor_view", "_tools_view", "_api_view",
             "_assistant_view", "_adapter_view",
+            "_settings_view", "_help_view", "_about_view",
         ):
             try:
                 view = getattr(self, view_attr, None)

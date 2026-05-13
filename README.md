@@ -4,24 +4,17 @@ A modern desktop network toolkit with an embedded terminal,
 multi-session SSH client, and Windows network-adapter configurator.
 Built with Python + PyQt6 — pure Python, no native extensions.
 
-```
-+-------------------+--------------------------------------------------+
-| WORKSPACE         |  NET ENGINE   Network Toolkit                    |
-| > Scanner         |  ----------------------------------------------- |
-|   Terminal        |  TOTAL SCANNED   ALIVE   OFFLINE   OPEN PORTS    |
-|   SSH Sessions    |       254          37       217        82       |
-|   Adapter         |  ----------------------------------------------- |
-|   Monitor         |  IP Address  Hostname    MAC ...   Status        |
-|   Tools           |  192.168...  router      ...       ALIVE         |
-|   API Console     |  ...                                             |
-+-------------------+--------------------------------------------------+
-```
+![Net Engine Scanner Demo](./assets/demo-scanner.gif)
+
 
 ## Features
 
 - **Subnet scanner** — concurrent ping sweep, reverse-DNS, ARP/MAC vendor
   lookup, OS hint from TTL, configurable TCP port scan, sortable + filterable
   results, CSV/JSON export, persistent scan history.
+
+![Scanner View](./assets/scanner.png)
+
 - **Host details drawer** — right-side toggleable panel that opens on row
   click and dismisses with an X button. Provides quick actions, host info,
   and an inline SSH connect form.
@@ -31,26 +24,43 @@ Built with Python + PyQt6 — pure Python, no native extensions.
 - **Embedded terminal** — full in-app terminal panel with selectable shell
   backend (`PowerShell`, `CMD`, `WSL` on Windows; `bash` on Linux). Supports
   command history, built-in `cd`/`clear`/`cls`, `Ctrl+C` / `Ctrl+L`.
+
+![Terminal View](./assets/terminal.png)
+
 - **SSH Sessions workspace** — multi-tab SSH client with collapsible
   connection form, saved-session manager (search + pin + last-connected),
   quick connect bar (`user@host:port`), per-tab status indicators, session
   duplication, and rename via double-click on the tab.
+
+![SSH Sessions](./assets/ssh.png)
+
+![File Transfer](./assets/file_transfer.png)
 - **Network adapter configuration (Windows)** — view current IPv4 settings,
   manage saved IP profiles, and switch between DHCP and static (address /
   mask / gateway / DNS) using `netsh`. Requires Administrator to apply.
+
+![Adapter Configuration](./assets/adapter.png)
 - **Monitor** — live multi-target ping monitor and one-shot port tester.
 - **Tools** — quick OS diagnostics (`ipconfig`, `arp`, `route`, `netsh`)
   with custom command runner and rolling activity log.
 - **API Console** — built-in REST client (Basic / Bearer auth, headers,
   body, save/load named requests, cURL import/export).
+
+![API Console](./assets/api_console.png)
 - **Local AI assistant** — optional, fully-local assistant powered by
   [Ollama](https://ollama.com). Two modes: a **Command assistant** that
   suggests one shell command per request (with explanation + caution,
   Copy / Insert-into-Terminal actions, never auto-executed), and a
   streaming **Chat assistant** for help and output interpretation.
   Ollama must be installed locally — see "Local AI (Ollama)" below.
+
+![AI Chat Assistant](./assets/ai_chat.png)
+
+![AI Command Assistant](./assets/ai_command.png)
 - **Production-grade UI** — theme-driven QSS, splitter layouts, status bar
   with live CPU/MEM, keyboard shortcuts, About dialog.
+
+![About Dialog](./assets/about.png)
 
 ## Project layout
 
