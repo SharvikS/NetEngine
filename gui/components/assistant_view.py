@@ -49,9 +49,11 @@ Reliability design:
 
 from __future__ import annotations
 
+import html as _html_lib
+import re as _re
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QSize, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QFont, QTextCursor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
@@ -116,6 +118,210 @@ class _SuggestionCard(QFrame):
         super().mousePressEvent(event)
 
 
+# ── Markdown renderer ──────────────────────────────────────────────────────
+
+
+def _format_inline(raw: str) -> str:
+    """Convert inline markdown in *raw* to an HTML-safe string."""
+    # Extract code spans so their content is not further processed.
+    spans: list[str] = []
+
+    def _pull(m: _re.Match) -> str:
+        spans.append(_html_lib.escape(m.group(1)))
+        return f"\x02{len(spans) - 1}\x03"
+
+    s = _re.sub(r"`([^`\n]+)`", _pull, raw)
+    s = _html_lib.escape(s)
+    # Bold+italic ***
+    s = _re.sub(r"\*{3}(.+?)\*{3}", r"<b><em>\1</em></b>", s)
+    # Bold **  or __
+    s = _re.sub(r"\*{2}(.+?)\*{2}", r"<b>\1</b>", s)
+    s = _re.sub(r"__(.+?)__", r"<b>\1</b>", s)
+    # Italic *  (not adjacent to another *)
+    s = _re.sub(r"(?<![*\w])\*([^*\n]+)\*(?![*\w])", r"<em>\1</em>", s)
+    # Italic _  (not adjacent to word char)
+    s = _re.sub(r"(?<![_\w])_([^_\n]+)_(?![_\w])", r"<em>\1</em>", s)
+    # Restore code spans
+    _CODE_STYLE = (
+        "font-family:'Consolas','Courier New',monospace;"
+        "background:rgba(128,128,128,0.15);"
+        "padding:1px 5px;border-radius:3px;font-size:0.92em;"
+    )
+    for i, code in enumerate(spans):
+        s = s.replace(
+            f"\x02{i}\x03",
+            f'<code style="{_CODE_STYLE}">{code}</code>',
+        )
+    return s
+
+
+def _md_to_html(text: str) -> str:
+    """Convert a markdown string to Qt-compatible HTML."""
+    if not text:
+        return ""
+
+    _FENCE_STYLE = (
+        "background:rgba(0,0,0,0.12);border-radius:6px;"
+        "padding:12px 14px;margin:8px 0;"
+        "font-family:'Consolas','Courier New',monospace;font-size:12px;"
+        "white-space:pre-wrap;overflow-wrap:break-word;"
+    )
+    _HR_STYLE = "border:none;border-top:1px solid rgba(128,128,128,0.3);margin:12px 0;"
+    _UL_STYLE = "margin:4px 0;padding-left:20px;"
+    _OL_STYLE = "margin:4px 0;padding-left:20px;"
+    _LI_STYLE = "margin:2px 0;"
+    _H_SIZE = {1: "18px", 2: "15px", 3: "14px", 4: "13px", 5: "12px", 6: "12px"}
+    _H_WEIGHT = {1: "800", 2: "700", 3: "700", 4: "600", 5: "600", 6: "600"}
+    _H_MARGIN = {1: "14px 0 4px 0", 2: "12px 0 4px 0", 3: "10px 0 2px 0"}
+
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Fenced code block
+        if stripped.startswith("```"):
+            body: list[str] = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                body.append(lines[i])
+                i += 1
+            if i < len(lines):
+                i += 1
+            escaped = _html_lib.escape("\n".join(body))
+            out.append(f'<pre style="{_FENCE_STYLE}">{escaped}</pre>')
+            continue
+
+        # Horizontal rule
+        if _re.fullmatch(r"[-*_]{3,}\s*", stripped):
+            out.append(f'<hr style="{_HR_STYLE}">')
+            i += 1
+            continue
+
+        # ATX heading
+        m = _re.match(r"^(#{1,6})\s+(.*)", line)
+        if m:
+            lvl = min(len(m.group(1)), 6)
+            body_html = _format_inline(m.group(2))
+            margin = _H_MARGIN.get(lvl, "10px 0 2px 0")
+            out.append(
+                f'<p style="font-size:{_H_SIZE[lvl]};'
+                f'font-weight:{_H_WEIGHT[lvl]};margin:{margin};">'
+                f"{body_html}</p>"
+            )
+            i += 1
+            continue
+
+        # Bullet list
+        if _re.match(r"^[-*+]\s+", line):
+            items: list[str] = []
+            while i < len(lines) and _re.match(r"^[-*+]\s+", lines[i]):
+                items.append(_format_inline(lines[i][2:].lstrip()))
+                i += 1
+            lis = "".join(f'<li style="{_LI_STYLE}">{it}</li>' for it in items)
+            out.append(f'<ul style="{_UL_STYLE}">{lis}</ul>')
+            continue
+
+        # Numbered list
+        if _re.match(r"^\d+[.)]\s+", line):
+            items = []
+            while i < len(lines) and _re.match(r"^\d+[.)]\s+", lines[i]):
+                items.append(_format_inline(_re.sub(r"^\d+[.)]\s+", "", lines[i])))
+                i += 1
+            lis = "".join(f'<li style="{_LI_STYLE}">{it}</li>' for it in items)
+            out.append(f'<ol style="{_OL_STYLE}">{lis}</ol>')
+            continue
+
+        # Blank line
+        if not stripped:
+            out.append("<br>")
+            i += 1
+            continue
+
+        # Paragraph — accumulate consecutive non-special lines
+        para: list[str] = []
+        while i < len(lines):
+            l = lines[i]
+            st = l.strip()
+            if (
+                not st
+                or st.startswith("```")
+                or _re.fullmatch(r"[-*_]{3,}\s*", st)
+                or _re.match(r"^#{1,6}\s", l)
+                or _re.match(r"^[-*+]\s+", l)
+                or _re.match(r"^\d+[.)]\s+", l)
+            ):
+                break
+            para.append(_format_inline(l))
+            i += 1
+        if para:
+            out.append(
+                '<p style="margin:4px 0;line-height:1.6;">'
+                + "<br>".join(para)
+                + "</p>"
+            )
+
+    return "".join(out)
+
+
+# ── AI bubble text widget ──────────────────────────────────────────────────
+
+
+class _AIBubbleText(QTextBrowser):
+    """Auto-sizing rich-text display for AI chat bubbles.
+
+    Streams plain text during inference, then renders markdown HTML when the
+    response is complete. Height tracks document content so the bubble grows
+    naturally inside the scroll area without internal scrollbars.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setOpenExternalLinks(False)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._plain_buf: str = ""
+        self.document().documentLayout().documentSizeChanged.connect(
+            lambda _: self.updateGeometry()
+        )
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.updateGeometry()
+
+    def sizeHint(self) -> QSize:
+        w = self.viewport().width()
+        if w > 0:
+            self.document().setTextWidth(w)
+        h = int(self.document().size().height()) + 4
+        return QSize(max(w, 100), max(h, 20))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(100, 20)
+
+    def set_plain_stream(self, text: str) -> None:
+        """Display raw text during streaming (no markdown processing)."""
+        self._plain_buf = text
+        self.setPlainText(text)
+
+    def set_rendered(self, text: str) -> None:
+        """Render *text* as markdown HTML (called when streaming is done)."""
+        self._plain_buf = text
+        self.setHtml(_md_to_html(text))
+        self.updateGeometry()
+
+    def plain_text(self) -> str:
+        """Return the original markdown source (used for copy / error append)."""
+        return self._plain_buf
+
+
 # ── View ───────────────────────────────────────────────────────────────────
 
 
@@ -166,9 +372,9 @@ class AssistantView(QWidget):
         self._cmd_raw_buffer = ""
         self._chat_stream_buffer = ""
         self._pending_user_msg = ""
-        # Reference to the QLabel inside the AI bubble currently being
-        # streamed into. Cleared when the response finishes/cancels/fails.
-        self._current_ai_text_label: Optional[QLabel] = None
+        # Reference to the _AIBubbleText widget currently being streamed into.
+        # Cleared when the response finishes/cancels/fails.
+        self._current_ai_widget: Optional[_AIBubbleText] = None
 
         # If the user hits Send before we've ever probed (or while a
         # probe is in flight), we stash the prompt here and send it
@@ -574,7 +780,7 @@ class AssistantView(QWidget):
         self._scroll_chat_to_bottom()
 
     def _add_ai_bubble(self) -> None:
-        """Add a left-aligned AI response bubble and set _current_ai_text_label."""
+        """Add a left-aligned AI response bubble and set _current_ai_widget."""
         row = QWidget()
         row_lay = QHBoxLayout(row)
         row_lay.setContentsMargins(8, 0, 8, 0)
@@ -587,27 +793,38 @@ class AssistantView(QWidget):
 
         b_lay = QVBoxLayout(bubble)
         b_lay.setContentsMargins(16, 12, 16, 12)
-        b_lay.setSpacing(4)
+        b_lay.setSpacing(6)
+
+        # Header row: role label left, copy button right
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(8)
 
         role_lbl = QLabel("AI")
         role_lbl.setObjectName("ai_bubble_role")
-        b_lay.addWidget(role_lbl)
+        header_row.addWidget(role_lbl)
+        header_row.addStretch(1)
 
-        lbl = QLabel("")
-        lbl.setObjectName("ai_bubble_text_ai")
-        lbl.setWordWrap(True)
-        lbl.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        lbl.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
-        b_lay.addWidget(lbl)
+        copy_btn = QPushButton("⎘ Copy")
+        copy_btn.setObjectName("ai_bubble_copy_btn")
+        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        header_row.addWidget(copy_btn)
+
+        b_lay.addLayout(header_row)
+
+        text_widget = _AIBubbleText()
+        text_widget.setObjectName("ai_bubble_text_browser")
+        b_lay.addWidget(text_widget)
+
+        copy_btn.clicked.connect(
+            lambda: self._on_copy_ai_response(copy_btn, text_widget))
 
         # Bubble:spacer = 4:1  →  bubble gets 80 % of row width, left-aligned
         row_lay.addWidget(bubble, stretch=4)
         row_lay.addStretch(1)
 
         self._chat_messages_layout.addWidget(row)
-        self._current_ai_text_label = lbl
+        self._current_ai_widget = text_widget
         self._scroll_chat_to_bottom()
 
     def _scroll_chat_to_bottom(self) -> None:
@@ -1206,8 +1423,8 @@ class AssistantView(QWidget):
             return
         try:
             self._chat_stream_buffer += piece
-            if self._current_ai_text_label is not None:
-                self._current_ai_text_label.setText(self._chat_stream_buffer)
+            if self._current_ai_widget is not None:
+                self._current_ai_widget.set_plain_stream(self._chat_stream_buffer)
             self._scroll_chat_to_bottom()
         except RuntimeError:
             return
@@ -1215,15 +1432,18 @@ class AssistantView(QWidget):
     def _on_chat_finished(self, worker: StreamWorker, full: str) -> None:
         if self._shutting_down or worker is not self._current_worker:
             return
-        if full:
+        final = full or self._chat_stream_buffer
+        if final:
             try:
                 self._service.chat_assistant.record_exchange(
-                    self._pending_user_msg, full,
+                    self._pending_user_msg, final,
                 )
             except Exception:
                 pass
         try:
-            self._current_ai_text_label = None
+            if self._current_ai_widget is not None:
+                self._current_ai_widget.set_rendered(final)
+            self._current_ai_widget = None
             self._scroll_chat_to_bottom()
             self._unlock_input()
         except RuntimeError:
@@ -1233,25 +1453,47 @@ class AssistantView(QWidget):
         if self._shutting_down or worker is not self._current_worker:
             return
         try:
-            if self._current_ai_text_label is not None:
-                existing = self._current_ai_text_label.text()
-                self._current_ai_text_label.setText(
-                    (existing + "\n\n[cancelled]").strip()
+            if self._current_ai_widget is not None:
+                partial = self._current_ai_widget.plain_text()
+                self._current_ai_widget.set_rendered(
+                    (partial + "\n\n*[cancelled]*").strip()
                 )
-                self._current_ai_text_label = None
+                self._current_ai_widget = None
             self._unlock_input()
+        except RuntimeError:
+            return
+
+    def _on_copy_ai_response(
+        self, btn: QPushButton, widget: _AIBubbleText
+    ) -> None:
+        if self._shutting_down:
+            return
+        text = widget.toPlainText().strip()
+        if not text:
+            return
+        ok = copy_text(text)
+        try:
+            btn.setText("✓ Copied" if ok else "✗ Failed")
+        except RuntimeError:
+            return
+        QTimer.singleShot(1500, lambda: self._reset_copy_btn(btn))
+
+    def _reset_copy_btn(self, btn: QPushButton) -> None:
+        if self._shutting_down:
+            return
+        try:
+            btn.setText("⎘ Copy")
         except RuntimeError:
             return
 
     def _on_clear_chat(self) -> None:
         self._on_stop()
-        # Remove all bubble widgets from the messages layout
         while self._chat_messages_layout.count():
             item = self._chat_messages_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
         self._chat_messages_layout.addStretch(1)
-        self._current_ai_text_label = None
+        self._current_ai_widget = None
         self._chat_panel_stack.setCurrentIndex(0)
         self._service.chat_assistant.clear()
 
@@ -1283,19 +1525,19 @@ class AssistantView(QWidget):
                 self._btn_copy.setEnabled(False)
                 self._btn_insert.setEnabled(False)
             else:
-                if self._current_ai_text_label is not None:
-                    existing = self._current_ai_text_label.text()
-                    self._current_ai_text_label.setText(
-                        (existing + f"\n\n[error: {message}]").strip()
+                if self._current_ai_widget is not None:
+                    partial = self._current_ai_widget.plain_text()
+                    self._current_ai_widget.set_rendered(
+                        (partial + f"\n\n*[error: {message}]*").strip()
                     )
-                    self._current_ai_text_label = None
+                    self._current_ai_widget = None
                 else:
                     self._add_ai_bubble()
-                    if self._current_ai_text_label is not None:
-                        self._current_ai_text_label.setText(
-                            f"[error: {message}]"
+                    if self._current_ai_widget is not None:
+                        self._current_ai_widget.set_rendered(
+                            f"*[error: {message}]*"
                         )
-                        self._current_ai_text_label = None
+                        self._current_ai_widget = None
             self.status_message.emit(f"AI error — {message[:80]}")
             self._unlock_input()
         except RuntimeError:
@@ -1496,8 +1738,21 @@ class AssistantView(QWidget):
             f"  color: {t.accent}; font-family: {mono}; font-size: 10px;"
             f"  font-weight: 800; letter-spacing: 1px;"
             f"}}"
-            f"QLabel#ai_bubble_text_ai {{"
-            f"  color: {t.text}; font-size: 13px;"
+            f"QPushButton#ai_bubble_copy_btn {{"
+            f"  background: transparent; color: {t.text_dim};"
+            f"  border: 1px solid {t.border_lt}; border-radius: 4px;"
+            f"  padding: 1px 8px; font-size: 10px; font-weight: 600;"
+            f"}}"
+            f"QPushButton#ai_bubble_copy_btn:hover {{"
+            f"  color: {t.accent}; border-color: {t.accent_dim};"
+            f"  background: {t.accent_bg};"
+            f"}}"
+            f"QTextBrowser#ai_bubble_text_browser {{"
+            f"  background: transparent; color: {t.text};"
+            f"  border: none; font-size: 13px;"
+            f"  font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;"
+            f"  selection-background-color: {t.accent_bg};"
+            f"  selection-color: {t.accent};"
             f"}}"
             # Unified input frame
             f"QFrame#ai_input_frame {{"
