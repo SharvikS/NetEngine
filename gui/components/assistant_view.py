@@ -55,7 +55,11 @@ from typing import Optional
 
 import time as _time
 
-from PyQt6.QtCore import Qt, QSize, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    Qt, QSize, QThread, QTimer,
+    QPropertyAnimation, QEasingCurve,
+    pyqtSignal, pyqtSlot, pyqtProperty,
+)
 from PyQt6.QtGui import QFont, QTextCursor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
@@ -335,6 +339,107 @@ class _AIBubbleText(QTextBrowser):
         return self._plain_buf
 
 
+# ── Auto-growing prompt input ──────────────────────────────────────────────
+
+
+class _GrowingInput(QPlainTextEdit):
+    """Prompt input that smoothly expands from 1 line up to 8 lines.
+
+    Height is animated via a ``QPropertyAnimation`` on a custom Qt property
+    so the resize is frame-interpolated and glitch-free. A vertical scrollbar
+    appears automatically once the content exceeds the 8-line cap.
+    """
+
+    _MIN_LINES = 1
+    _MAX_LINES = 8
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._resize_pending = False
+
+        # Animation drives both min/max height together through the
+        # 'animHeight' Qt property defined below.
+        self._anim = QPropertyAnimation(self, b"animHeight")
+        self._anim.setDuration(130)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        self.document().contentsChanged.connect(self._schedule_resize)
+
+    # ── Animatable Qt property ─────────────────────────────────────
+
+    def _get_anim_h(self) -> int:
+        return self.minimumHeight()
+
+    def _set_anim_h(self, h: int) -> None:
+        self.setMinimumHeight(h)
+        self.setMaximumHeight(h)
+
+    animHeight = pyqtProperty(int, fget=_get_anim_h, fset=_set_anim_h)
+
+    # ── Resize logic ───────────────────────────────────────────────
+
+    def _schedule_resize(self) -> None:
+        """Defer the resize to the next event-loop tick so the document
+        layout has already settled before we measure it."""
+        if not self._resize_pending:
+            self._resize_pending = True
+            QTimer.singleShot(0, self._do_resize)
+
+    def _do_resize(self) -> None:
+        self._resize_pending = False
+        vw = self.viewport().width()
+        if vw <= 0:
+            return
+
+        doc = self.document()
+        doc.setTextWidth(vw)
+        content_h = int(doc.size().height())
+
+        fm = self.fontMetrics()
+        line_h = fm.lineSpacing() or 18
+        # Vertical padding = frame borders + content margins + a little breathing room
+        pad = (self.frameWidth() * 2
+               + self.contentsMargins().top()
+               + self.contentsMargins().bottom()
+               + 10)
+
+        min_h = line_h * self._MIN_LINES + pad
+        max_h = line_h * self._MAX_LINES + pad
+        target = max(min_h, min(max_h, content_h + pad))
+
+        # Show the scrollbar only when content overflows the 8-line cap
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            if content_h + pad > max_h
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        cur = self.minimumHeight()
+        if cur <= 0:
+            # First paint — set directly, no animation needed
+            self._set_anim_h(target)
+            return
+        if abs(target - cur) < 2:
+            return  # avoid micro-jitter on every keystroke
+
+        self._anim.stop()
+        self._anim.setStartValue(cur)
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    # ── Qt event hooks ─────────────────────────────────────────────
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Measure after the widget is actually laid out
+        QTimer.singleShot(10, self._do_resize)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # Viewport width changed — content may reflow to more/fewer lines
+        self._schedule_resize()
+
+
 # ── View ───────────────────────────────────────────────────────────────────
 
 
@@ -556,17 +661,22 @@ class AssistantView(QWidget):
         input_frame_lay.setContentsMargins(12, 8, 8, 8)
         input_frame_lay.setSpacing(8)
 
-        self._input = QPlainTextEdit()
+        self._input = _GrowingInput()
         self._input.setObjectName("ai_input")
         self._input.setPlaceholderText("Send a message…  (Ctrl+Enter)")
-        self._input.setFixedHeight(52)
         self._input.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         input_frame_lay.addWidget(self._input, stretch=1)
 
-        btns = QVBoxLayout()
+        # Button column: stretch pushes send/stop to the bottom so they
+        # sit at the input baseline when the textarea is tall.
+        btns_wrap = QWidget()
+        btns_wrap.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        btns = QVBoxLayout(btns_wrap)
         btns.setSpacing(4)
         btns.setContentsMargins(0, 0, 0, 0)
+        btns.addStretch(1)
 
         self._btn_send = QPushButton("↑")
         self._btn_send.setObjectName("ai_send_btn")
@@ -585,7 +695,7 @@ class AssistantView(QWidget):
         self._btn_stop.clicked.connect(self._on_stop)
         btns.addWidget(self._btn_stop)
 
-        input_frame_lay.addLayout(btns)
+        input_frame_lay.addWidget(btns_wrap)
         root.addWidget(input_frame)
 
         # Ctrl+Enter / Cmd+Enter sends from the input box.
@@ -2037,6 +2147,26 @@ class AssistantView(QWidget):
             f"  background: transparent; color: {t.text};"
             f"  border: none;"
             f"  font-family: {mono}; font-size: 13px;"
+            f"}}"
+            # Slim, always-visible scrollbar inside the prompt input
+            f"QPlainTextEdit#ai_input QScrollBar:vertical {{"
+            f"  width: 6px; background: transparent; border: none;"
+            f"  margin: 3px 2px 3px 0px;"
+            f"}}"
+            f"QPlainTextEdit#ai_input QScrollBar::handle:vertical {{"
+            f"  background: {t.border_lt}; border-radius: 3px;"
+            f"  min-height: 20px;"
+            f"}}"
+            f"QPlainTextEdit#ai_input QScrollBar::handle:vertical:hover {{"
+            f"  background: {t.text_dim};"
+            f"}}"
+            f"QPlainTextEdit#ai_input QScrollBar::add-line:vertical,"
+            f"QPlainTextEdit#ai_input QScrollBar::sub-line:vertical {{"
+            f"  height: 0px;"
+            f"}}"
+            f"QPlainTextEdit#ai_input QScrollBar::add-page:vertical,"
+            f"QPlainTextEdit#ai_input QScrollBar::sub-page:vertical {{"
+            f"  background: none;"
             f"}}"
             f"QPushButton#ai_send_btn {{"
             f"  background: {t.accent}; color: {t.bg_base};"
