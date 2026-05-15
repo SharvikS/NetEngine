@@ -43,6 +43,23 @@ PAGE_MONOGRAMS: list[str] = [
     "SET", "?", "i",
 ]
 
+# Icon characters shown instead of monograms when the sidebar is collapsed.
+# Each symbol was chosen for immediate visual association with the page.
+PAGE_ICONS: list[str] = [
+    "⊙",   # Scanner   — bullseye/radar
+    "⌨",   # Terminal  — keyboard
+    "⇄",   # SSH       — bidirectional connection
+    "⇅",   # Files     — up/down transfer
+    "⊞",   # Adapter   — network grid
+    "▣",   # Monitor   — screen/display
+    "⚙",   # Tools     — gear
+    "⊕",   # API       — endpoint/plus
+    "✦",   # Assistant — AI sparkle
+    "☰",   # Settings  — hamburger
+    "?",   # Help      — question mark
+    "ℹ",   # About     — information
+]
+
 
 class BrandHeader(QWidget):
     """
@@ -904,6 +921,8 @@ class Sidebar(QWidget):
             btn.setProperty("full_label", name.upper())
             mono = PAGE_MONOGRAMS[i] if i < len(PAGE_MONOGRAMS) else name[:2].upper()
             btn.setProperty("monogram", mono)
+            icon = PAGE_ICONS[i] if i < len(PAGE_ICONS) else mono
+            btn.setProperty("icon_char", icon)
             btn.setText(name.upper())
             self._group.addButton(btn, i)
             root.addWidget(btn)
@@ -1118,9 +1137,9 @@ class Sidebar(QWidget):
         self._brand_header.set_compact(compact)
 
         if compact:
-            # Replace nav button text with monograms and centre them.
+            # Replace nav button text with icon characters and centre them.
             for btn in self._buttons:
-                btn.setText(btn.property("monogram"))
+                btn.setText(btn.property("icon_char"))
 
             # Hide the "WORKSPACE" heading text but keep its row so
             # the toggle button stays visible. The STATUS label / host
@@ -1318,10 +1337,10 @@ class Sidebar(QWidget):
                 f"  text-align: center;"
                 f"  padding: 8px 0;"
                 f"  margin: 0;"
-                f"  font-family: 'JetBrains Mono', 'Consolas', monospace;"
-                f"  font-size: 10px;"
-                f"  font-weight: 800;"
-                f"  letter-spacing: 0.8px;"
+                f"  font-family: 'Segoe UI Symbol', 'Segoe UI', 'Arial Unicode MS', sans-serif;"
+                f"  font-size: 18px;"
+                f"  font-weight: 400;"
+                f"  letter-spacing: 0px;"
                 f"  border-radius: 0;"
                 f"  min-height: 36px;"
                 f"}}"
