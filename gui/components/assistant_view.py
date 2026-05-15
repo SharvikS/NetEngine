@@ -70,7 +70,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
-    QTextBrowser, QFrame, QSizePolicy, QApplication,
+    QTextBrowser, QFrame, QStackedWidget, QSizePolicy, QApplication,
     QLineEdit, QComboBox, QScrollArea, QGridLayout,
     QListWidget, QListWidgetItem, QMenu,
 )
