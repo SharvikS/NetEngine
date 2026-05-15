@@ -1,16 +1,15 @@
 """
-Local-only AI configuration.
+AI configuration — supports Ollama (local) and Groq (cloud) providers.
 
 Persisted to ``~/.netscope/settings.json`` via the existing
 ``utils.settings`` module under the ``ai`` key. Defaults target a
-small instruct model so the integration works out of the box as long
-as the user has pulled the model with::
+small instruct model via Ollama so the integration works out of the
+box as long as the user has pulled the model with::
 
     ollama pull llama3.2:3b
 
-No network endpoint other than localhost is ever used. The caller
-can swap in a different model at runtime by editing the AI settings
-panel or by writing directly to settings.json.
+Set ``provider = "groq"`` and supply a ``groq_api_key`` to use
+Groq's free cloud inference instead of a local Ollama daemon.
 """
 
 from __future__ import annotations
@@ -29,9 +28,16 @@ class AIConfig:
     #: renders a disabled banner and refuses to issue requests.
     enabled: bool = True
 
+    #: Which backend to use. "ollama" (default) uses the local daemon;
+    #: "groq" uses Groq's free cloud API (requires groq_api_key).
+    provider: str = "ollama"
+
+    #: API key for the Groq cloud provider. Unused when provider="ollama".
+    #: Get a free key at console.groq.com.
+    groq_api_key: str = ""
+
     #: Where to reach the local Ollama daemon. Only localhost-style
-    #: URLs are expected — remote hosts would violate the "fully local"
-    #: contract of this integration and should not be configured here.
+    #: URLs are expected. Unused when provider="groq".
     base_url: str = "http://localhost:11434"
 
     #: Primary chat/instruct model. Acts as the *initial* default

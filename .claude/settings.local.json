@@ -33,7 +33,9 @@
       "Bash(set NETENGINE_SSH_DEBUG=1)",
       "Bash(grep -E \"^\\(TERMINAL|\\\\\\\\s\\\\\\\\s\\\\\\\\[FAIL\\)\")",
       "Bash(grep -E \"^\\(SSH LOOPBACK|\\\\\\\\s\\\\\\\\s\\\\\\\\[FAIL\\)\")",
-      "Bash(grep -E \"^\\(SSH SESSION|\\\\\\\\s\\\\\\\\s\\\\\\\\[FAIL\\)\")"
+      "Bash(grep -E \"^\\(SSH SESSION|\\\\\\\\s\\\\\\\\s\\\\\\\\[FAIL\\)\")",
+      "Bash(git checkout *)",
+      "Bash(git add *)"
     ]
   }
 }

@@ -228,27 +228,46 @@ class SettingsView(QWidget):
         cfg = load_ai_config()
 
         # Enable toggle
-        self._ai_enabled = QCheckBox("Enable the local AI assistant")
+        self._ai_enabled = QCheckBox("Enable the AI assistant")
         self._ai_enabled.setChecked(bool(cfg.enabled))
         self._ai_enabled.toggled.connect(self._on_ai_dirty)
         form.addRow("", self._ai_enabled)
 
-        hint = QLabel(
-            "Uses a local <b>Ollama</b> daemon. Nothing ever leaves "
-            "your machine. Install with <code>ollama pull llama3.2:3b</code>."
-        )
-        hint.setObjectName("lbl_subtitle")
-        hint.setWordWrap(True)
-        hint.setTextFormat(Qt.TextFormat.RichText)
-        self._ai_hint = hint
-        form.addRow("", hint)
+        # Provider picker
+        self._ai_provider = QComboBox()
+        self._ai_provider.addItem("Ollama  (local, no internet required)", "ollama")
+        self._ai_provider.addItem("Groq  (free cloud, fast)", "groq")
+        self._ai_provider.setMinimumWidth(260)
+        idx = self._ai_provider.findData(cfg.provider or "ollama")
+        if idx >= 0:
+            self._ai_provider.setCurrentIndex(idx)
+        self._ai_provider.currentIndexChanged.connect(self._on_ai_dirty)
+        self._ai_provider.currentIndexChanged.connect(self._sync_ai_provider_fields)
+        form.addRow("Provider:", self._ai_provider)
 
-        # Base URL
+        # Dynamic hint — updated by _sync_ai_provider_fields
+        self._ai_hint = QLabel()
+        self._ai_hint.setObjectName("lbl_subtitle")
+        self._ai_hint.setWordWrap(True)
+        self._ai_hint.setTextFormat(Qt.TextFormat.RichText)
+        form.addRow("", self._ai_hint)
+
+        # Ollama base URL (hidden when provider=groq)
         self._ai_url = QLineEdit(cfg.base_url)
         self._ai_url.setPlaceholderText("http://localhost:11434")
         self._ai_url.setMinimumWidth(260)
         self._ai_url.textChanged.connect(self._on_ai_dirty)
-        form.addRow("Ollama base URL:", self._ai_url)
+        self._ai_url_label = QLabel("Ollama base URL:")
+        form.addRow(self._ai_url_label, self._ai_url)
+
+        # Groq API key (hidden when provider=ollama)
+        self._ai_groq_key = QLineEdit(cfg.groq_api_key)
+        self._ai_groq_key.setPlaceholderText("gsk_…  (paste your key here)")
+        self._ai_groq_key.setMinimumWidth(260)
+        self._ai_groq_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._ai_groq_key.textChanged.connect(self._on_ai_dirty)
+        self._ai_groq_key_label = QLabel("Groq API key:")
+        form.addRow(self._ai_groq_key_label, self._ai_groq_key)
 
         # Default model — read-only reminder; real picker lives on
         # Assistant page so the dropdown stays in lockstep with the
@@ -257,12 +276,11 @@ class SettingsView(QWidget):
             cfg.effective_model() or "(not configured)"
         )
         self._ai_model_label.setObjectName("settings_readonly_value")
-        form.addRow("Default model:", self._ai_model_label)
+        form.addRow("Active model:", self._ai_model_label)
 
         model_hint = QLabel(
             "Pick or switch models from the <b>Assistant</b> page — "
-            "the dropdown there reflects which models are actually "
-            "installed and updates live."
+            "the dropdown there reflects available models and updates live."
         )
         model_hint.setObjectName("lbl_subtitle")
         model_hint.setWordWrap(True)
@@ -320,8 +338,32 @@ class SettingsView(QWidget):
         self._ai_dirty = False
         self._ai_loaded_cfg = cfg
         self._refresh_ai_button_state()
+        self._sync_ai_provider_fields()
 
         return box
+
+    def _sync_ai_provider_fields(self, *_args) -> None:
+        """Show/hide provider-specific rows and update the hint text."""
+        is_groq = self._ai_provider.currentData() == "groq"
+
+        if is_groq:
+            self._ai_hint.setText(
+                "Uses <b>Groq Cloud</b> for fast, free AI inference. "
+                "Your messages are sent to Groq's servers. "
+                "Get a free key at <code>console.groq.com</code> — "
+                "no credit card required."
+            )
+        else:
+            self._ai_hint.setText(
+                "Uses a local <b>Ollama</b> daemon. Nothing ever leaves "
+                "your machine. Install with "
+                "<code>ollama pull llama3.2:3b</code>."
+            )
+
+        self._ai_url_label.setVisible(not is_groq)
+        self._ai_url.setVisible(not is_groq)
+        self._ai_groq_key_label.setVisible(is_groq)
+        self._ai_groq_key.setVisible(is_groq)
 
     def _on_ai_dirty(self, *_args) -> None:
         self._ai_dirty = True
@@ -338,23 +380,30 @@ class SettingsView(QWidget):
 
     def _on_ai_revert(self) -> None:
         cfg = self._ai_loaded_cfg
-        self._ai_enabled.blockSignals(True)
-        self._ai_url.blockSignals(True)
-        self._ai_timeout.blockSignals(True)
-        self._ai_max_tokens.blockSignals(True)
-        self._ai_temperature.blockSignals(True)
+        for w in (
+            self._ai_enabled, self._ai_provider,
+            self._ai_url, self._ai_groq_key,
+            self._ai_timeout, self._ai_max_tokens, self._ai_temperature,
+        ):
+            w.blockSignals(True)
         try:
             self._ai_enabled.setChecked(bool(cfg.enabled))
+            idx = self._ai_provider.findData(cfg.provider or "ollama")
+            if idx >= 0:
+                self._ai_provider.setCurrentIndex(idx)
             self._ai_url.setText(cfg.base_url)
+            self._ai_groq_key.setText(cfg.groq_api_key)
             self._ai_timeout.setValue(int(cfg.timeout))
             self._ai_max_tokens.setValue(int(cfg.max_tokens))
             self._ai_temperature.setValue(float(cfg.temperature))
         finally:
-            self._ai_enabled.blockSignals(False)
-            self._ai_url.blockSignals(False)
-            self._ai_timeout.blockSignals(False)
-            self._ai_max_tokens.blockSignals(False)
-            self._ai_temperature.blockSignals(False)
+            for w in (
+                self._ai_enabled, self._ai_provider,
+                self._ai_url, self._ai_groq_key,
+                self._ai_timeout, self._ai_max_tokens, self._ai_temperature,
+            ):
+                w.blockSignals(False)
+        self._sync_ai_provider_fields()
         self._ai_dirty = False
         self._refresh_ai_button_state()
 
@@ -366,7 +415,9 @@ class SettingsView(QWidget):
         new_cfg = replace(
             current,
             enabled=self._ai_enabled.isChecked(),
+            provider=self._ai_provider.currentData() or "ollama",
             base_url=self._ai_url.text().strip() or current.base_url,
+            groq_api_key=self._ai_groq_key.text().strip(),
             timeout=int(self._ai_timeout.value()),
             max_tokens=int(self._ai_max_tokens.value()),
             temperature=float(self._ai_temperature.value()),

@@ -401,6 +401,10 @@ class _RefreshWorker(QObject):
         except OllamaError as exc:
             self.failed.emit(str(exc) or "Ollama error during model refresh.")
             return
+        except RuntimeError as exc:
+            # Catches GroqError, GroqAuthError, GroqUnavailable, etc.
+            self.failed.emit(str(exc) or "Model refresh error.")
+            return
         except Exception as exc:  # pragma: no cover — last-resort catch
             self.failed.emit(f"Unexpected model refresh error: {exc}")
             return

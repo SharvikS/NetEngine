@@ -57,10 +57,11 @@ class AIStatus:
     ``state`` is a short machine-readable tag so the UI can pick the
     right banner title without string-matching the message:
 
-        "ok"          — reachable and model installed
+        "ok"          — reachable and model installed/available
         "disabled"    — user turned AI off in settings
         "checking"    — a probe is currently running; nothing decided
-        "unreachable" — daemon not running / connection refused
+        "unreachable" — daemon/API not running / connection refused
+        "no_key"      — Groq provider selected but API key missing/invalid
         "no_model"    — daemon up but configured model missing
         "timeout"     — daemon took too long to answer
         "error"       — anything else
@@ -158,7 +159,11 @@ class AIService:
 
     @staticmethod
     def _build(cfg: AIConfig):
-        client = OllamaClient(base_url=cfg.base_url, timeout=cfg.timeout)
+        if cfg.provider == "groq":
+            from ai.groq_client import GroqClient
+            client = GroqClient(api_key=cfg.groq_api_key, timeout=cfg.timeout)
+        else:
+            client = OllamaClient(base_url=cfg.base_url, timeout=cfg.timeout)
         cmd = CommandAssistant(client, cfg)
         chat = ChatAssistant(client, cfg)
         return client, cmd, chat
@@ -342,7 +347,7 @@ class AIService:
         return status
 
     def _probe_status_blocking(self) -> AIStatus:
-        """Actually hit ``/api/version`` and ``/api/tags``. Never raises.
+        """Probe the active AI backend. Never raises.
 
         Runs on whatever thread calls it — the UI wraps this in a
         QThread via ``probe_status_async`` so it can't stall the
@@ -351,6 +356,90 @@ class AIService:
         if not self._config.enabled:
             return AIStatus.disabled()
 
+        if self._config.provider == "groq":
+            return self._probe_groq_blocking()
+        return self._probe_ollama_blocking()
+
+    def _probe_groq_blocking(self) -> AIStatus:
+        """Probe the Groq cloud backend. Never raises."""
+        from ai.groq_client import (
+            GroqAuthError, GroqError, GroqRateLimit,
+            GroqTimeout, GroqUnavailable,
+        )
+        try:
+            version = self._client.ping()
+        except GroqAuthError as exc:
+            return AIStatus(
+                ok=False, reachable=False, model_installed=False,
+                state="no_key",
+                message=str(exc),
+                remedy=(
+                    "Get a free API key at console.groq.com, then enter "
+                    "it in Settings → AI Assistant."
+                ),
+            )
+        except GroqUnavailable as exc:
+            return AIStatus(
+                ok=False, reachable=False, model_installed=False,
+                state="unreachable",
+                message=str(exc),
+                remedy="Check your internet connection.",
+            )
+        except GroqTimeout as exc:
+            return AIStatus(
+                ok=False, reachable=False, model_installed=False,
+                state="timeout",
+                message=str(exc),
+                remedy="Check your internet connection and try again.",
+            )
+        except (GroqRateLimit, GroqError) as exc:
+            return AIStatus(
+                ok=False, reachable=False, model_installed=False,
+                state="error",
+                message=str(exc),
+                remedy="Check your API key and internet connection.",
+            )
+        except Exception as exc:
+            return AIStatus(
+                ok=False, reachable=False, model_installed=False,
+                state="error",
+                message=f"Unexpected Groq probe error: {exc}",
+                remedy="Restart the app.",
+            )
+
+        try:
+            models = self._client.list_model_info()
+        except Exception:
+            models = []
+
+        try:
+            self._model_manager.push_models(list(models))
+        except Exception:
+            pass
+
+        if models:
+            installed = any(m.name == self._config.model for m in models)
+        else:
+            installed = True  # Can't verify without a model list; be optimistic.
+
+        if not installed:
+            return AIStatus(
+                ok=False, reachable=True, model_installed=False,
+                state="no_model",
+                version=version,
+                message=f"Model '{self._config.model}' not found on Groq.",
+                remedy="Pick a model from the dropdown on the Assistant page.",
+            )
+
+        return AIStatus(
+            ok=True, reachable=True, model_installed=True,
+            state="ok",
+            version=version,
+            message=f"Groq Cloud  ·  model {self._config.model}",
+        )
+
+    def _probe_ollama_blocking(self) -> AIStatus:
+        """Probe the local Ollama daemon. Never raises."""
         # Step 1: is Ollama even up?
         try:
             version = self._client.ping()
@@ -389,9 +478,8 @@ class AIService:
 
         # Step 2: fetch the full model list once, push it to the
         # registry, and derive "is the configured model installed?"
-        # locally. This collapses what used to be two API calls
-        # (list_models + has_model → list_models again) into one
-        # and keeps the UI dropdown in lockstep with the probe.
+        # locally. This collapses two API calls into one and keeps
+        # the UI dropdown in lockstep with the probe.
         try:
             models = self._client.list_model_info()
         except OllamaUnavailable as exc:
@@ -424,16 +512,9 @@ class AIService:
                 message=f"Unexpected AI probe error: {exc}",
             )
 
-        # Push the discovered list into the registry. ``push_models``
-        # is thread-safe — it routes through a queued Qt signal so
-        # the actual ``_models`` mutation always lands on the
-        # manager's home thread, even when the probe is running on
-        # a background worker.
         try:
             self._model_manager.push_models(list(models))
         except Exception:
-            # The registry is a convenience — a push failure must
-            # never bubble up and turn a green probe into a red one.
             pass
 
         installed = any(
@@ -640,6 +721,10 @@ class StreamWorker(QObject):
         except OllamaModelMissing as exc:
             self.failed.emit(str(exc))
         except OllamaError as exc:
+            self.failed.emit(str(exc))
+        except RuntimeError as exc:
+            # Catches GroqError, GroqUnavailable, GroqAuthError, etc.
+            # All AI client errors inherit RuntimeError.
             self.failed.emit(str(exc))
         except Exception as exc:  # defensive; unknown failure mode
             self.failed.emit(f"Unexpected AI error: {exc}")
