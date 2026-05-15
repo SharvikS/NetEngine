@@ -39,6 +39,10 @@ _DEFAULTS: dict[str, Any] = {
     # About page — index of the last tagline shown. Lets the rotating
     # line advance across restarts instead of always starting at 0.
     "about_tagline_index": -1,
+    # AI chat history sync folder. When non-empty, chat sessions are
+    # read/written here instead of the local ~/.netscope/chats/ dir.
+    # Point to a Dropbox/OneDrive folder to sync history across machines.
+    "chat_sync_dir": "",
 }
 
 

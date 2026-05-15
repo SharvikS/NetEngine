@@ -288,6 +288,46 @@ class SettingsView(QWidget):
         self._ai_model_hint = model_hint
         form.addRow("", model_hint)
 
+        # Chat history sync folder
+        sync_sep = QFrame()
+        sync_sep.setFrameShape(QFrame.Shape.HLine)
+        sync_sep.setObjectName("settings_separator")
+        form.addRow(sync_sep)
+
+        sync_lbl_head = QLabel("CHAT HISTORY")
+        sync_lbl_head.setObjectName("settings_section_mini")
+        form.addRow("", sync_lbl_head)
+
+        sync_row = QWidget()
+        sync_lay = QHBoxLayout(sync_row)
+        sync_lay.setContentsMargins(0, 0, 0, 0)
+        sync_lay.setSpacing(6)
+
+        self._ai_sync_dir = QLineEdit(settings.get("chat_sync_dir") or "")
+        self._ai_sync_dir.setPlaceholderText(
+            "Optional: path to Dropbox / OneDrive folder…")
+        self._ai_sync_dir.setMinimumWidth(200)
+        self._ai_sync_dir.textChanged.connect(self._on_ai_dirty)
+        sync_lay.addWidget(self._ai_sync_dir, stretch=1)
+
+        btn_browse_sync = QPushButton("Browse…")
+        btn_browse_sync.setObjectName("btn_action")
+        btn_browse_sync.clicked.connect(self._on_browse_sync_dir)
+        sync_lay.addWidget(btn_browse_sync)
+
+        form.addRow("Sync folder:", sync_row)
+
+        sync_hint = QLabel(
+            "When set, chat history is saved here instead of the local "
+            "<code>~/.netscope/chats/</code> folder. "
+            "Point it at a cloud-synced directory to share history "
+            "across machines — no account or API required."
+        )
+        sync_hint.setObjectName("lbl_subtitle")
+        sync_hint.setWordWrap(True)
+        sync_hint.setTextFormat(Qt.TextFormat.RichText)
+        form.addRow("", sync_hint)
+
         # Timeout
         self._ai_timeout = QSpinBox()
         self._ai_timeout.setRange(5, 600)
@@ -365,6 +405,14 @@ class SettingsView(QWidget):
         self._ai_groq_key_label.setVisible(is_groq)
         self._ai_groq_key.setVisible(is_groq)
 
+    def _on_browse_sync_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "Select chat sync folder",
+            self._ai_sync_dir.text() or str(__import__("pathlib").Path.home()),
+        )
+        if path:
+            self._ai_sync_dir.setText(path)
+
     def _on_ai_dirty(self, *_args) -> None:
         self._ai_dirty = True
         self._refresh_ai_button_state()
@@ -384,6 +432,7 @@ class SettingsView(QWidget):
             self._ai_enabled, self._ai_provider,
             self._ai_url, self._ai_groq_key,
             self._ai_timeout, self._ai_max_tokens, self._ai_temperature,
+            self._ai_sync_dir,
         ):
             w.blockSignals(True)
         try:
@@ -396,11 +445,13 @@ class SettingsView(QWidget):
             self._ai_timeout.setValue(int(cfg.timeout))
             self._ai_max_tokens.setValue(int(cfg.max_tokens))
             self._ai_temperature.setValue(float(cfg.temperature))
+            self._ai_sync_dir.setText(settings.get("chat_sync_dir") or "")
         finally:
             for w in (
                 self._ai_enabled, self._ai_provider,
                 self._ai_url, self._ai_groq_key,
                 self._ai_timeout, self._ai_max_tokens, self._ai_temperature,
+                self._ai_sync_dir,
             ):
                 w.blockSignals(False)
         self._sync_ai_provider_fields()
@@ -410,6 +461,8 @@ class SettingsView(QWidget):
     def _on_ai_apply(self) -> None:
         if not self._ai_dirty:
             return
+        # Persist the sync folder immediately (it's not part of AIConfig)
+        settings.set_value("chat_sync_dir", self._ai_sync_dir.text().strip())
         current = load_ai_config()
         from dataclasses import replace
         new_cfg = replace(

@@ -53,14 +53,18 @@ import html as _html_lib
 import re as _re
 from typing import Optional
 
+import time as _time
+
 from PyQt6.QtCore import Qt, QSize, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QFont, QTextCursor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
     QTextBrowser, QFrame, QStackedWidget, QSizePolicy, QApplication,
     QLineEdit, QComboBox, QScrollArea, QScrollBar, QGridLayout,
+    QListWidget, QListWidgetItem, QMenu,
 )
 
+from ai.chat_history import ChatHistoryManager, ChatSession, ChatMessage, auto_title, relative_time
 from ai.ai_service import (
     AIService,
     AIStatus,
@@ -156,7 +160,7 @@ def _format_inline(raw: str) -> str:
 
 
 def _md_to_html(text: str) -> str:
-    """Convert a markdown string to Qt-compatible HTML."""
+    """Convert a markdown string to Qt-compatible HTML with UTF-8 charset."""
     if not text:
         return ""
 
@@ -264,7 +268,16 @@ def _md_to_html(text: str) -> str:
                 + "</p>"
             )
 
-    return "".join(out)
+    body = "".join(out)
+    # Wrap in a proper HTML document with UTF-8 charset so Qt's renderer
+    # correctly handles em dashes, curly quotes, and other non-ASCII chars.
+    return (
+        '<!DOCTYPE html><html><head>'
+        '<meta charset="utf-8"/>'
+        '</head><body style="margin:0;padding:0;">'
+        + body
+        + '</body></html>'
+    )
 
 
 # ── AI bubble text widget ──────────────────────────────────────────────────
@@ -375,6 +388,11 @@ class AssistantView(QWidget):
         # Reference to the _AIBubbleText widget currently being streamed into.
         # Cleared when the response finishes/cancels/fails.
         self._current_ai_widget: Optional[_AIBubbleText] = None
+
+        # Chat history persistence
+        self._history_manager = ChatHistoryManager()
+        self._current_session: ChatSession = ChatSession.new()
+        self._history_sidebar_visible = True
 
         # If the user hits Send before we've ever probed (or while a
         # probe is in flight), we stash the prompt here and send it
@@ -658,14 +676,34 @@ class AssistantView(QWidget):
 
     def _build_chat_panel(self) -> QWidget:
         panel = QWidget()
-        lay = QVBoxLayout(panel)
+        outer = QHBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── History sidebar ────────────────────────────────────────
+        self._history_sidebar = self._build_history_sidebar()
+        outer.addWidget(self._history_sidebar)
+
+        # ── Main chat area ─────────────────────────────────────────
+        chat_main = QWidget()
+        lay = QVBoxLayout(chat_main)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Thin top bar: just the "New chat" button aligned right
+        # Top bar: history toggle + new chat button
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 8)
+
+        self._btn_toggle_history = QPushButton("☰")
+        self._btn_toggle_history.setObjectName("ai_toggle_history")
+        self._btn_toggle_history.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_toggle_history.setFixedWidth(32)
+        self._btn_toggle_history.setToolTip("Toggle chat history")
+        self._btn_toggle_history.clicked.connect(self._toggle_history_sidebar)
+        top.addWidget(self._btn_toggle_history)
+
         top.addStretch(1)
+
         self._btn_clear_chat = QPushButton("+ New chat")
         self._btn_clear_chat.setObjectName("ai_clear_chat")
         self._btn_clear_chat.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -690,13 +728,56 @@ class AssistantView(QWidget):
         self._chat_messages_layout = QVBoxLayout(self._chat_messages_widget)
         self._chat_messages_layout.setContentsMargins(0, 8, 0, 8)
         self._chat_messages_layout.setSpacing(16)
-        self._chat_messages_layout.addStretch(1)  # push bubbles to top
+        self._chat_messages_layout.addStretch(1)
 
         self._chat_scroll.setWidget(self._chat_messages_widget)
         self._chat_panel_stack.addWidget(self._chat_scroll)
 
         lay.addWidget(self._chat_panel_stack, stretch=1)
+        outer.addWidget(chat_main, stretch=1)
         return panel
+
+    def _build_history_sidebar(self) -> QFrame:
+        """Build the collapsible chat history sidebar."""
+        sidebar = QFrame()
+        sidebar.setObjectName("ai_history_sidebar")
+        sidebar.setFixedWidth(220)
+        sidebar.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+
+        lay = QVBoxLayout(sidebar)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # Header
+        header = QFrame()
+        header.setObjectName("ai_hist_header")
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(12, 8, 8, 8)
+        h_lay.setSpacing(4)
+
+        title_lbl = QLabel("Chats")
+        title_lbl.setObjectName("ai_hist_header_title")
+        h_lay.addWidget(title_lbl)
+        h_lay.addStretch(1)
+
+        lay.addWidget(header)
+
+        # Search / list
+        self._history_list = QListWidget()
+        self._history_list.setObjectName("ai_hist_list")
+        self._history_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._history_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._history_list.itemClicked.connect(self._on_history_item_clicked)
+        self._history_list.customContextMenuRequested.connect(
+            self._on_history_context_menu)
+        lay.addWidget(self._history_list, stretch=1)
+
+        # Seed the list
+        self._refresh_history_list()
+        return sidebar
 
     def _build_welcome_widget(self) -> QWidget:
         w = QWidget()
@@ -779,8 +860,13 @@ class AssistantView(QWidget):
         self._chat_messages_layout.addWidget(row)
         self._scroll_chat_to_bottom()
 
-    def _add_ai_bubble(self) -> None:
-        """Add a left-aligned AI response bubble and set _current_ai_widget."""
+    def _add_ai_bubble(self, static_text: Optional[str] = None) -> None:
+        """Add a left-aligned AI response bubble.
+
+        When *static_text* is provided the bubble is rendered immediately
+        as finished markdown (used when replaying history). When None the
+        bubble starts empty and ``_current_ai_widget`` is set for streaming.
+        """
         row = QWidget()
         row_lay = QHBoxLayout(row)
         row_lay.setContentsMargins(8, 0, 8, 0)
@@ -824,7 +910,10 @@ class AssistantView(QWidget):
         row_lay.addStretch(1)
 
         self._chat_messages_layout.addWidget(row)
-        self._current_ai_widget = text_widget
+        if static_text is not None:
+            text_widget.set_rendered(static_text)
+        else:
+            self._current_ai_widget = text_widget
         self._scroll_chat_to_bottom()
 
     def _scroll_chat_to_bottom(self) -> None:
@@ -1440,6 +1529,8 @@ class AssistantView(QWidget):
                 )
             except Exception:
                 pass
+            # Persist the exchange to the current session
+            self._append_to_session(self._pending_user_msg, final)
         try:
             if self._current_ai_widget is not None:
                 self._current_ai_widget.set_rendered(final)
@@ -1462,6 +1553,138 @@ class AssistantView(QWidget):
             self._unlock_input()
         except RuntimeError:
             return
+
+    # ── Chat history management ────────────────────────────────────
+
+    def _append_to_session(self, user_msg: str, ai_msg: str) -> None:
+        """Add a completed exchange to the current session and save."""
+        now = _time.time()
+        self._current_session.messages.append(
+            ChatMessage("user", user_msg.strip(), now))
+        self._current_session.messages.append(
+            ChatMessage("assistant", ai_msg.strip(), now))
+        self._current_session.updated_at = now
+        # Auto-generate a title from the very first user message
+        if len(self._current_session.messages) == 2:
+            self._current_session.title = auto_title(user_msg)
+        self._history_manager.save_session(self._current_session)
+        self._refresh_history_list()
+
+    def _refresh_history_list(self) -> None:
+        """Repopulate the history sidebar from saved sessions."""
+        if self._shutting_down:
+            return
+        try:
+            self._history_list.clear()
+            sessions = self._history_manager.list_sessions()
+            for session in sessions:
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, session.id)
+                item.setSizeHint(QSize(200, 52))
+                self._history_list.addItem(item)
+                self._history_list.setItemWidget(item, self._make_hist_widget(session))
+        except RuntimeError:
+            return
+
+    def _make_hist_widget(self, session: ChatSession) -> QWidget:
+        """Build the two-line widget shown inside each history list item."""
+        w = QWidget()
+        w.setObjectName("ai_hist_item")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(10, 6, 10, 4)
+        lay.setSpacing(1)
+
+        title = session.title or "Chat"
+        if len(title) > 30:
+            title = title[:28] + "…"
+        t = QLabel(title)
+        t.setObjectName("ai_hist_item_title")
+        lay.addWidget(t)
+
+        n = session.message_count
+        count_str = f"{n} message{'s' if n != 1 else ''}"
+        sub = QLabel(f"{relative_time(session.updated_at)}  ·  {count_str}")
+        sub.setObjectName("ai_hist_item_time")
+        lay.addWidget(sub)
+
+        return w
+
+    def _on_history_item_clicked(self, item: QListWidgetItem) -> None:
+        """Load a past session when the user clicks it in the list."""
+        if self._shutting_down:
+            return
+        session_id = item.data(Qt.ItemDataRole.UserRole)
+        if not session_id:
+            return
+        # Don't reload the session we're already in
+        if session_id == self._current_session.id:
+            return
+        self._load_session(session_id)
+
+    def _on_history_context_menu(self, pos) -> None:
+        """Right-click: offer Delete for a history item."""
+        item = self._history_list.itemAt(pos)
+        if not item:
+            return
+        session_id = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete")
+        action = menu.exec(self._history_list.mapToGlobal(pos))
+        if action is delete_action:
+            self._history_manager.delete_session(session_id)
+            # If we deleted the current session, start fresh
+            if session_id == self._current_session.id:
+                self._on_clear_chat()
+            else:
+                self._refresh_history_list()
+
+    def _load_session(self, session_id: str) -> None:
+        """Save current session, then load and display a past one."""
+        session = self._history_manager.load_session(session_id)
+        if not session:
+            return
+        # Stop any ongoing inference
+        self._on_stop()
+        # Persist current session (non-empty only)
+        self._history_manager.save_session(self._current_session)
+        # Switch to the loaded session
+        self._current_session = session
+        # Restore in-memory assistant history
+        msgs = [{"role": m.role, "content": m.content}
+                for m in session.messages]
+        try:
+            self._service.chat_assistant.load_from_messages(msgs)
+        except Exception:
+            pass
+        # Rebuild the visual message list
+        self._render_session_history(session)
+        self._refresh_history_list()
+
+    def _render_session_history(self, session: ChatSession) -> None:
+        """Clear the bubble list and replay a session's messages."""
+        self._current_ai_widget = None
+        while self._chat_messages_layout.count():
+            item = self._chat_messages_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._chat_messages_layout.addStretch(1)
+
+        for msg in session.messages:
+            if msg.role == "user":
+                self._add_user_bubble(msg.content)
+            elif msg.role == "assistant":
+                self._add_ai_bubble(static_text=msg.content)
+
+        if session.messages:
+            self._chat_panel_stack.setCurrentIndex(1)
+        else:
+            self._chat_panel_stack.setCurrentIndex(0)
+        self._scroll_chat_to_bottom()
+
+    def _toggle_history_sidebar(self) -> None:
+        """Show or hide the history sidebar."""
+        self._history_sidebar_visible = not self._history_sidebar_visible
+        self._history_sidebar.setVisible(self._history_sidebar_visible)
 
     def _on_copy_ai_response(
         self, btn: QPushButton, widget: _AIBubbleText
@@ -1488,6 +1711,8 @@ class AssistantView(QWidget):
 
     def _on_clear_chat(self) -> None:
         self._on_stop()
+        # Save any in-progress session before wiping
+        self._history_manager.save_session(self._current_session)
         while self._chat_messages_layout.count():
             item = self._chat_messages_layout.takeAt(0)
             if item.widget():
@@ -1496,6 +1721,9 @@ class AssistantView(QWidget):
         self._current_ai_widget = None
         self._chat_panel_stack.setCurrentIndex(0)
         self._service.chat_assistant.clear()
+        # Start a fresh session
+        self._current_session = ChatSession.new()
+        self._refresh_history_list()
 
     def _append_chat_role(
         self,
@@ -1678,6 +1906,49 @@ class AssistantView(QWidget):
             f"}}"
             f"QLabel#ai_cmd_caution {{"
             f"  color: {accent2}; font-size: 12px; font-weight: 700;"
+            f"}}"
+            # History sidebar
+            f"QFrame#ai_history_sidebar {{"
+            f"  background: {t.bg_raised};"
+            f"  border: none; border-right: 1px solid {t.border_lt};"
+            f"}}"
+            f"QFrame#ai_hist_header {{"
+            f"  background: {t.bg_raised};"
+            f"  border-bottom: 1px solid {t.border_lt};"
+            f"}}"
+            f"QLabel#ai_hist_header_title {{"
+            f"  color: {t.text_dim}; font-family: {mono}; font-size: 10px;"
+            f"  font-weight: 800; letter-spacing: 1px;"
+            f"}}"
+            f"QListWidget#ai_hist_list {{"
+            f"  background: {t.bg_raised}; border: none;"
+            f"  outline: none;"
+            f"}}"
+            f"QListWidget#ai_hist_list::item {{"
+            f"  background: transparent; border-bottom: 1px solid {t.border};"
+            f"  padding: 0px;"
+            f"}}"
+            f"QListWidget#ai_hist_list::item:selected {{"
+            f"  background: {t.accent_bg}; border-bottom: 1px solid {t.border};"
+            f"}}"
+            f"QListWidget#ai_hist_list::item:hover:!selected {{"
+            f"  background: {t.bg_base};"
+            f"}}"
+            f"QWidget#ai_hist_item {{ background: transparent; }}"
+            f"QLabel#ai_hist_item_title {{"
+            f"  color: {t.text}; font-size: 11px; font-weight: 600;"
+            f"}}"
+            f"QLabel#ai_hist_item_time {{"
+            f"  color: {t.text_dim}; font-size: 10px;"
+            f"}}"
+            # Toggle sidebar button
+            f"QPushButton#ai_toggle_history {{"
+            f"  background: transparent; color: {t.text_dim};"
+            f"  border: 1px solid {t.border_lt}; border-radius: 4px;"
+            f"  font-size: 13px; padding: 2px 0px;"
+            f"}}"
+            f"QPushButton#ai_toggle_history:hover {{"
+            f"  color: {t.accent}; border-color: {t.accent_dim};"
             f"}}"
             # Chat panel — new chat interface
             f"QPushButton#ai_clear_chat {{"

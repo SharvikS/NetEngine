@@ -45,6 +45,19 @@ class ChatAssistant:
         """Return a shallow copy of the current history (for tests / UI)."""
         return list(self._history)
 
+    def load_from_messages(self, messages: list[dict]) -> None:
+        """Replace in-memory history with a saved session's message list.
+
+        Each dict must have ``role`` and ``content`` keys. Excess entries
+        are trimmed to ``MAX_HISTORY_MESSAGES``.
+        """
+        self._history = [
+            {"role": m["role"], "content": m["content"]}
+            for m in messages
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        self._trim_history()
+
     def _trim_history(self) -> None:
         overflow = len(self._history) - self.MAX_HISTORY_MESSAGES
         if overflow > 0:
