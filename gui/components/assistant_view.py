@@ -546,24 +546,30 @@ class AssistantView(QWidget):
         row = QWidget()
         row_lay = QHBoxLayout(row)
         row_lay.setContentsMargins(8, 0, 8, 0)
-        row_lay.addStretch(1)
+        row_lay.setSpacing(0)
 
         bubble = QFrame()
         bubble.setObjectName("ai_user_bubble")
+        bubble.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         b_lay = QVBoxLayout(bubble)
-        b_lay.setContentsMargins(14, 10, 14, 10)
+        b_lay.setContentsMargins(16, 12, 16, 12)
         b_lay.setSpacing(0)
 
         lbl = QLabel(text)
         lbl.setObjectName("ai_bubble_text_user")
         lbl.setWordWrap(True)
+        lbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         lbl.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        lbl.setMaximumWidth(560)
         b_lay.addWidget(lbl)
 
-        row_lay.addWidget(bubble)
+        # Spacer:bubble = 1:4  →  bubble gets 80 % of row width, right-aligned
+        row_lay.addStretch(1)
+        row_lay.addWidget(bubble, stretch=4)
+
         self._chat_messages_layout.addWidget(row)
         self._scroll_chat_to_bottom()
 
@@ -572,12 +578,15 @@ class AssistantView(QWidget):
         row = QWidget()
         row_lay = QHBoxLayout(row)
         row_lay.setContentsMargins(8, 0, 8, 0)
+        row_lay.setSpacing(0)
 
         bubble = QFrame()
         bubble.setObjectName("ai_ai_bubble")
+        bubble.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         b_lay = QVBoxLayout(bubble)
-        b_lay.setContentsMargins(14, 10, 14, 10)
+        b_lay.setContentsMargins(16, 12, 16, 12)
         b_lay.setSpacing(4)
 
         role_lbl = QLabel("AI")
@@ -587,13 +596,14 @@ class AssistantView(QWidget):
         lbl = QLabel("")
         lbl.setObjectName("ai_bubble_text_ai")
         lbl.setWordWrap(True)
+        lbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         lbl.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        lbl.setMaximumWidth(640)
-        lbl.setMinimumWidth(80)
         b_lay.addWidget(lbl)
 
-        row_lay.addWidget(bubble)
+        # Bubble:spacer = 4:1  →  bubble gets 80 % of row width, left-aligned
+        row_lay.addWidget(bubble, stretch=4)
         row_lay.addStretch(1)
 
         self._chat_messages_layout.addWidget(row)
