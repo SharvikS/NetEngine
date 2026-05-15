@@ -1,19 +1,26 @@
 """
-AI Assistant page — local Ollama, two modes, graceful offline state.
+AI Assistant page — unified chat with automatic command detection.
 
 Layout::
 
     +---------------------------------------------------------------+
-    |  [Command] [Chat]              Ollama 0.x · model llama3.2    |
+    |  Model: [dropdown] [↻]   Ollama 0.x · model llama3.2 [Retry] |
     +---------------------------------------------------------------+
     |  [status banner — only when AI is unavailable]                |
     +---------------------------------------------------------------+
-    |                                                               |
-    |  <mode content — QStackedWidget switches Command / Chat>      |
-    |                                                               |
+    |  [history sidebar] |  [chat history toggle]  [+ New chat]     |
+    |                    |                                           |
+    |                    |  <chat bubbles — welcome screen or msgs>  |
+    |                    |                                           |
     +---------------------------------------------------------------+
     |  input textarea                                   [Send] [Stop]|
     +---------------------------------------------------------------+
+
+Command detection: the AI is prompted to respond with a structured
+COMMAND:/EXPLAIN:/CAUTION: block when the user asks for a shell
+command. The view detects this format on completion and renders an
+inline command card with Copy and Insert-into-Terminal buttons instead
+of plain markdown — without requiring a separate Command mode.
 
 Reliability design:
 
@@ -60,11 +67,11 @@ from PyQt6.QtCore import (
     QPropertyAnimation, QEasingCurve,
     pyqtSignal, pyqtSlot, pyqtProperty,
 )
-from PyQt6.QtGui import QFont, QTextCursor, QKeySequence, QShortcut
+from PyQt6.QtGui import QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
-    QTextBrowser, QFrame, QStackedWidget, QSizePolicy, QApplication,
-    QLineEdit, QComboBox, QScrollArea, QScrollBar, QGridLayout,
+    QTextBrowser, QFrame, QSizePolicy, QApplication,
+    QLineEdit, QComboBox, QScrollArea, QGridLayout,
     QListWidget, QListWidgetItem, QMenu,
 )
 
@@ -74,7 +81,6 @@ from ai.ai_service import (
     AIStatus,
     StreamWorker,
     make_chat_worker,
-    make_command_worker,
     run_stream_worker,
 )
 from ai.command_assistant import parse_command_response, CommandSuggestion
@@ -440,6 +446,95 @@ class _GrowingInput(QPlainTextEdit):
         self._schedule_resize()
 
 
+# ── Inline command card ────────────────────────────────────────────────────
+
+
+class _CommandCard(QFrame):
+    """Inline command suggestion card rendered inside an AI chat bubble.
+
+    Displays the suggested command, explanation, optional caution, and
+    Copy / Insert-into-Terminal action buttons.  The card never
+    executes anything — Insert only pre-fills the terminal input; the
+    user must press Enter themselves.
+    """
+
+    insert_to_terminal = pyqtSignal(str)
+
+    def __init__(self, suggestion, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ai_cmd_card")
+        self._command = (suggestion.command or "").strip()
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+
+        section_lbl = QLabel("SUGGESTED COMMAND")
+        section_lbl.setObjectName("ai_cmd_card_label")
+        lay.addWidget(section_lbl)
+
+        self._cmd_display = QLineEdit(self._command)
+        self._cmd_display.setReadOnly(True)
+        self._cmd_display.setObjectName("ai_cmd_card_line")
+        self._cmd_display.setFont(_mono_font())
+        lay.addWidget(self._cmd_display)
+
+        if suggestion.explanation:
+            explain_lbl = QLabel(suggestion.explanation)
+            explain_lbl.setObjectName("ai_cmd_card_explain")
+            explain_lbl.setWordWrap(True)
+            explain_lbl.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse)
+            lay.addWidget(explain_lbl)
+
+        if suggestion.caution:
+            caution_lbl = QLabel(f"⚠  {suggestion.caution}")
+            caution_lbl.setObjectName("ai_cmd_card_caution")
+            caution_lbl.setWordWrap(True)
+            lay.addWidget(caution_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.setContentsMargins(0, 4, 0, 0)
+
+        self._btn_copy = QPushButton("⎘ Copy")
+        self._btn_copy.setObjectName("ai_cmd_card_action")
+        self._btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_copy.clicked.connect(self._on_copy)
+        btn_row.addWidget(self._btn_copy)
+
+        if self._command:
+            btn_insert = QPushButton("Insert into Terminal")
+            btn_insert.setObjectName("ai_cmd_card_action")
+            btn_insert.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_insert.setToolTip(
+                "Pre-fill the Terminal tab's input with this command.\n"
+                "You must press Enter to run it."
+            )
+            btn_insert.clicked.connect(
+                lambda: self.insert_to_terminal.emit(self._command))
+            btn_row.addWidget(btn_insert)
+
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+    def _on_copy(self) -> None:
+        if not self._command:
+            return
+        ok = copy_text(self._command)
+        try:
+            self._btn_copy.setText("✓ Copied" if ok else "✗ Failed")
+        except RuntimeError:
+            return
+        QTimer.singleShot(1500, self._reset_copy_btn)
+
+    def _reset_copy_btn(self) -> None:
+        try:
+            self._btn_copy.setText("⎘ Copy")
+        except RuntimeError:
+            pass
+
+
 # ── View ───────────────────────────────────────────────────────────────────
 
 
@@ -484,15 +579,14 @@ class AssistantView(QWidget):
         # revert it if the user picks an unusable entry.
         self._active_model_name: str = ""
 
-        self._mode = "command"
-
         # Per-run state — cleared on each new request.
-        self._cmd_raw_buffer = ""
         self._chat_stream_buffer = ""
         self._pending_user_msg = ""
-        # Reference to the _AIBubbleText widget currently being streamed into.
-        # Cleared when the response finishes/cancels/fails.
+        # Reference to the _AIBubbleText and its parent layout/copy-btn
+        # currently being streamed into. Cleared when the response ends.
         self._current_ai_widget: Optional[_AIBubbleText] = None
+        self._current_bubble_layout: Optional[QVBoxLayout] = None
+        self._current_copy_btn: Optional[QPushButton] = None
 
         # Chat history persistence
         self._history_manager = ChatHistoryManager()
@@ -502,7 +596,7 @@ class AssistantView(QWidget):
         # If the user hits Send before we've ever probed (or while a
         # probe is in flight), we stash the prompt here and send it
         # once the probe returns ok.
-        self._pending_send: tuple[str, str] = ("", "")  # (mode, prompt)
+        self._pending_send: str = ""
 
         self._build_ui()
 
@@ -541,27 +635,9 @@ class AssistantView(QWidget):
         root.setContentsMargins(22, 18, 22, 22)
         root.setSpacing(12)
 
-        # ── Top bar: mode toggle + version label ───────────────────
+        # ── Top bar: model selector + version label ────────────────
         top = QHBoxLayout()
         top.setSpacing(8)
-
-        self._btn_mode_command = QPushButton("Command")
-        self._btn_mode_command.setObjectName("ai_mode_btn")
-        self._btn_mode_command.setCheckable(True)
-        self._btn_mode_command.setChecked(True)
-        self._btn_mode_command.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_mode_command.clicked.connect(
-            lambda: self._switch_mode("command"))
-        top.addWidget(self._btn_mode_command)
-
-        self._btn_mode_chat = QPushButton("Chat")
-        self._btn_mode_chat.setObjectName("ai_mode_btn")
-        self._btn_mode_chat.setCheckable(True)
-        self._btn_mode_chat.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_mode_chat.clicked.connect(
-            lambda: self._switch_mode("chat"))
-        top.addWidget(self._btn_mode_chat)
-
         top.addStretch(1)
 
         # ── Model selector ────────────────────────────────────────
@@ -648,11 +724,8 @@ class AssistantView(QWidget):
         root.addWidget(self._banner)
         self._banner.setVisible(False)
 
-        # ── Mode content stack ─────────────────────────────────────
-        self._stack = QStackedWidget()
-        self._stack.addWidget(self._build_command_panel())
-        self._stack.addWidget(self._build_chat_panel())
-        root.addWidget(self._stack, stretch=1)
+        # ── Chat panel (the only content panel) ───────────────────
+        root.addWidget(self._build_chat_panel(), stretch=1)
 
         # ── Bottom input area (unified chat-style bar) ─────────────
         input_frame = QFrame()
@@ -703,86 +776,6 @@ class AssistantView(QWidget):
         send_sc.activated.connect(self._on_send)
         send_sc2 = QShortcut(QKeySequence("Ctrl+Enter"), self._input)
         send_sc2.activated.connect(self._on_send)
-
-    def _build_command_panel(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
-
-        hint = QLabel(
-            "Ask in plain English. The assistant suggests one shell "
-            "command, explains it, and flags anything risky. "
-            "Nothing is executed — you copy and run it yourself."
-        )
-        hint.setWordWrap(True)
-        hint.setObjectName("ai_hint")
-        lay.addWidget(hint)
-
-        # Command box — the final suggested command, copy-pasteable.
-        cmd_row_wrap = QFrame()
-        cmd_row_wrap.setObjectName("ai_cmd_box")
-        cmd_lay = QVBoxLayout(cmd_row_wrap)
-        cmd_lay.setContentsMargins(12, 10, 12, 10)
-        cmd_lay.setSpacing(8)
-
-        cmd_label = QLabel("SUGGESTED COMMAND")
-        cmd_label.setObjectName("ai_section_label")
-        cmd_lay.addWidget(cmd_label)
-
-        self._cmd_line = QLineEdit()
-        self._cmd_line.setReadOnly(True)
-        self._cmd_line.setObjectName("ai_cmd_line")
-        self._cmd_line.setFont(_mono_font())
-        self._cmd_line.setPlaceholderText(
-            "(the suggested command will appear here)"
-        )
-        cmd_lay.addWidget(self._cmd_line)
-
-        cmd_btn_row = QHBoxLayout()
-        cmd_btn_row.setSpacing(8)
-        self._btn_copy = QPushButton("Copy")
-        self._btn_copy.setObjectName("ai_cmd_action")
-        self._btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_copy.setEnabled(False)
-        self._btn_copy.clicked.connect(self._on_copy_command)
-        cmd_btn_row.addWidget(self._btn_copy)
-
-        self._btn_insert = QPushButton("Insert into Terminal")
-        self._btn_insert.setObjectName("ai_cmd_action")
-        self._btn_insert.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_insert.setEnabled(False)
-        self._btn_insert.setToolTip(
-            "Switch to the Terminal tab and pre-fill the input with this "
-            "command. You still have to press Enter to run it."
-        )
-        self._btn_insert.clicked.connect(self._on_insert_to_terminal)
-        cmd_btn_row.addWidget(self._btn_insert)
-
-        self._lbl_copy_state = QLabel("")
-        self._lbl_copy_state.setObjectName("ai_copy_state")
-        cmd_btn_row.addWidget(self._lbl_copy_state)
-        cmd_btn_row.addStretch(1)
-        cmd_lay.addLayout(cmd_btn_row)
-
-        lay.addWidget(cmd_row_wrap)
-
-        # Explanation + caution panels.
-        self._cmd_explain = QLabel("")
-        self._cmd_explain.setObjectName("ai_cmd_explain")
-        self._cmd_explain.setWordWrap(True)
-        self._cmd_explain.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
-        lay.addWidget(self._cmd_explain)
-
-        self._cmd_caution = QLabel("")
-        self._cmd_caution.setObjectName("ai_cmd_caution")
-        self._cmd_caution.setWordWrap(True)
-        self._cmd_caution.setVisible(False)
-        lay.addWidget(self._cmd_caution)
-
-        lay.addStretch(1)
-        return w
 
     def _build_chat_panel(self) -> QWidget:
         panel = QWidget()
@@ -974,8 +967,9 @@ class AssistantView(QWidget):
         """Add a left-aligned AI response bubble.
 
         When *static_text* is provided the bubble is rendered immediately
-        as finished markdown (used when replaying history). When None the
-        bubble starts empty and ``_current_ai_widget`` is set for streaming.
+        (history replay). If the text is a command response it shows a
+        command card instead of markdown. When None the bubble starts
+        empty and the streaming references are set for later attachment.
         """
         row = QWidget()
         row_lay = QHBoxLayout(row)
@@ -1020,10 +1014,24 @@ class AssistantView(QWidget):
         row_lay.addStretch(1)
 
         self._chat_messages_layout.addWidget(row)
+
         if static_text is not None:
-            text_widget.set_rendered(static_text)
+            # History replay — detect command vs. plain markdown
+            suggestion = parse_command_response(static_text)
+            if suggestion.has_command:
+                text_widget.setVisible(False)
+                copy_btn.setVisible(False)
+                card = _CommandCard(suggestion)
+                card.insert_to_terminal.connect(self.insert_to_terminal)
+                b_lay.addWidget(card)
+            else:
+                text_widget.set_rendered(static_text)
         else:
+            # Live streaming — record all three refs for later use
             self._current_ai_widget = text_widget
+            self._current_bubble_layout = b_lay
+            self._current_copy_btn = copy_btn
+
         self._scroll_chat_to_bottom()
 
     def _scroll_chat_to_bottom(self) -> None:
@@ -1040,30 +1048,6 @@ class AssistantView(QWidget):
         self._input.setFocus()
         if self._status is not None and self._status.state == "ok":
             self._on_send()
-
-    # ── Mode switching ─────────────────────────────────────────────
-
-    def _switch_mode(self, mode: str) -> None:
-        if mode == self._mode:
-            self._btn_mode_command.setChecked(mode == "command")
-            self._btn_mode_chat.setChecked(mode == "chat")
-            return
-        # Stop any in-flight request — each mode has its own prompt
-        # path, so we don't want a half-stream from the previous mode
-        # landing in the wrong panel. Worker identity checks in the
-        # slot handlers then ensure late signals from the old worker
-        # can't corrupt the new mode's UI state.
-        self._on_stop()
-        self._pending_send = ("", "")
-        self._mode = mode
-        self._btn_mode_command.setChecked(mode == "command")
-        self._btn_mode_chat.setChecked(mode == "chat")
-        self._stack.setCurrentIndex(0 if mode == "command" else 1)
-        self._input.setPlaceholderText(
-            "Ask for a command…  (Ctrl+Enter)"
-            if mode == "command"
-            else "Send a message…  (Ctrl+Enter)"
-        )
 
     # ── Status probe (async) ───────────────────────────────────────
 
@@ -1125,21 +1109,17 @@ class AssistantView(QWidget):
         except RuntimeError:
             return
 
-        pending_mode, pending_prompt = self._pending_send
-        if pending_prompt and pending_mode == self._mode:
-            self._pending_send = ("", "")
+        pending_prompt = self._pending_send
+        if pending_prompt:
+            self._pending_send = ""
             if status.ok:
                 self._start_inference(pending_prompt)
             else:
                 try:
-                    # Probe failed — unlock the input and show the banner.
                     self._input.setReadOnly(False)
                     self._btn_send.setEnabled(False)
                 except RuntimeError:
                     return
-        elif pending_prompt:
-            # Mode changed while probe was running — discard.
-            self._pending_send = ("", "")
 
     def _apply_status(self, status: AIStatus) -> None:
         """Render an ``AIStatus`` into the header label + banner."""
@@ -1439,23 +1419,18 @@ class AssistantView(QWidget):
 
         # Otherwise queue the prompt, show a "checking…" banner, and
         # re-probe. The probe callback will fire the send if ok.
-        self._pending_send = (self._mode, prompt)
+        self._pending_send = prompt
         self._input.setReadOnly(True)
         self._btn_send.setEnabled(False)
         self._apply_status(AIStatus.checking())
         self._kick_probe(force=True)
 
     def _start_inference(self, prompt: str) -> None:
-        """Branch to the current mode's inference path."""
+        """Start a chat inference request."""
         self._input.setReadOnly(True)
         self._btn_send.setEnabled(False)
         self._btn_stop.setEnabled(True)
-        self._lbl_copy_state.setText("")
-
-        if self._mode == "command":
-            self._start_command_request(prompt)
-        else:
-            self._start_chat_request(prompt)
+        self._start_chat_request(prompt)
 
     def _on_stop(self) -> None:
         """Request cancellation of the active worker.
@@ -1481,120 +1456,6 @@ class AssistantView(QWidget):
         self._btn_stop.setEnabled(False)
         self._current_worker = None
         self._current_thread = None
-
-    # ── Command path ───────────────────────────────────────────────
-
-    def _start_command_request(self, prompt: str) -> None:
-        self._cmd_raw_buffer = ""
-        self._cmd_line.setText("")
-        self._cmd_explain.setText("thinking…")
-        self._cmd_caution.setVisible(False)
-        self._btn_copy.setEnabled(False)
-        self._btn_insert.setEnabled(False)
-
-        worker = make_command_worker(self._service, prompt)
-        # Bind the worker instance into each slot so late signals
-        # from a superseded run can't touch the UI.
-        worker.chunk.connect(
-            lambda piece, w=worker: self._on_command_chunk(w, piece))
-        worker.finished.connect(
-            lambda full, w=worker: self._on_command_finished(w, full))
-        worker.cancelled.connect(
-            lambda full, w=worker: self._on_command_cancelled(w, full))
-        worker.failed.connect(
-            lambda msg, w=worker: self._on_request_failed(w, msg))
-        self._current_worker = worker
-        self._current_thread = run_stream_worker(self, worker)
-
-    def _on_command_chunk(self, worker: StreamWorker, piece: str) -> None:
-        if self._shutting_down or worker is not self._current_worker:
-            return
-        try:
-            self._cmd_raw_buffer += piece
-            self._cmd_explain.setText(
-                "thinking…  ("
-                f"{len(self._cmd_raw_buffer)} chars received)"
-            )
-        except RuntimeError:
-            return
-
-    def _on_command_finished(self, worker: StreamWorker, full: str) -> None:
-        if self._shutting_down or worker is not self._current_worker:
-            return
-        try:
-            suggestion: CommandSuggestion = parse_command_response(
-                self._cmd_raw_buffer or full
-            )
-            if suggestion.has_command:
-                self._cmd_line.setText(suggestion.command)
-                self._cmd_explain.setText(
-                    suggestion.explanation
-                    or "(model returned a command but no explanation)"
-                )
-                if suggestion.caution:
-                    self._cmd_caution.setText(f"⚠  {suggestion.caution}")
-                    self._cmd_caution.setVisible(True)
-                else:
-                    self._cmd_caution.setVisible(False)
-                self._btn_copy.setEnabled(True)
-                self._btn_insert.setEnabled(True)
-            else:
-                self._cmd_line.setText("")
-                self._cmd_explain.setText(
-                    suggestion.explanation
-                    or "(the model couldn't produce a command for that request)"
-                )
-                self._cmd_caution.setVisible(False)
-                self._btn_copy.setEnabled(False)
-                self._btn_insert.setEnabled(False)
-            self._unlock_input()
-        except RuntimeError:
-            return
-
-    def _on_command_cancelled(self, worker: StreamWorker, _partial: str) -> None:
-        if self._shutting_down or worker is not self._current_worker:
-            return
-        try:
-            self._cmd_explain.setText("(cancelled)")
-            self._cmd_caution.setVisible(False)
-            self._btn_copy.setEnabled(False)
-            self._btn_insert.setEnabled(False)
-            self._unlock_input()
-        except RuntimeError:
-            return
-
-    def _clear_copy_state_later(self) -> None:
-        """
-        Clear the copy-feedback label after the 1500ms debounce. Used
-        via QTimer.singleShot; guarded so a close-during-feedback
-        never hits a deleted QLabel.
-        """
-        if self._shutting_down:
-            return
-        try:
-            self._lbl_copy_state.setText("")
-        except RuntimeError:
-            return
-
-    def _on_copy_command(self) -> None:
-        if self._shutting_down:
-            return
-        cmd = self._cmd_line.text().strip()
-        if not cmd:
-            return
-        ok = copy_text(cmd)
-        try:
-            self._lbl_copy_state.setText("copied" if ok else "copy failed")
-        except RuntimeError:
-            return
-        QTimer.singleShot(1500, self._clear_copy_state_later)
-
-    def _on_insert_to_terminal(self) -> None:
-        cmd = self._cmd_line.text().strip()
-        if cmd:
-            # MainWindow handles switching pages + pre-filling the
-            # terminal input. We never submit — the user presses Enter.
-            self.insert_to_terminal.emit(cmd)
 
     # ── Chat path ──────────────────────────────────────────────────
 
@@ -1639,12 +1500,24 @@ class AssistantView(QWidget):
                 )
             except Exception:
                 pass
-            # Persist the exchange to the current session
             self._append_to_session(self._pending_user_msg, final)
         try:
             if self._current_ai_widget is not None:
-                self._current_ai_widget.set_rendered(final)
+                suggestion = parse_command_response(final)
+                if suggestion.has_command:
+                    # Hide the raw streamed text; attach a command card instead
+                    self._current_ai_widget.setVisible(False)
+                    if self._current_copy_btn is not None:
+                        self._current_copy_btn.setVisible(False)
+                    if self._current_bubble_layout is not None:
+                        card = _CommandCard(suggestion)
+                        card.insert_to_terminal.connect(self.insert_to_terminal)
+                        self._current_bubble_layout.addWidget(card)
+                else:
+                    self._current_ai_widget.set_rendered(final)
             self._current_ai_widget = None
+            self._current_bubble_layout = None
+            self._current_copy_btn = None
             self._scroll_chat_to_bottom()
             self._unlock_input()
         except RuntimeError:
@@ -1660,6 +1533,8 @@ class AssistantView(QWidget):
                     (partial + "\n\n*[cancelled]*").strip()
                 )
                 self._current_ai_widget = None
+            self._current_bubble_layout = None
+            self._current_copy_btn = None
             self._unlock_input()
         except RuntimeError:
             return
@@ -1835,47 +1710,27 @@ class AssistantView(QWidget):
         self._current_session = ChatSession.new()
         self._refresh_history_list()
 
-    def _append_chat_role(
-        self,
-        role: Optional[str],
-        text: str,
-    ) -> None:
-        cursor = self._chat_log.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        if role == "you":
-            cursor.insertText(f"\n>>> you\n{text}\n\n")
-        elif role == "assistant":
-            cursor.insertText("<<< assistant\n")
-        else:
-            cursor.insertText("\n")
-        self._chat_log.setTextCursor(cursor)
-        self._chat_log.ensureCursorVisible()
-
     # ── Shared failure handler ─────────────────────────────────────
 
     def _on_request_failed(self, worker: StreamWorker, message: str) -> None:
         if self._shutting_down or worker is not self._current_worker:
             return
         try:
-            if self._mode == "command":
-                self._cmd_explain.setText(f"error: {message}")
-                self._cmd_caution.setVisible(False)
-                self._btn_copy.setEnabled(False)
-                self._btn_insert.setEnabled(False)
+            if self._current_ai_widget is not None:
+                partial = self._current_ai_widget.plain_text()
+                self._current_ai_widget.set_rendered(
+                    (partial + f"\n\n*[error: {message}]*").strip()
+                )
+                self._current_ai_widget = None
             else:
+                self._add_ai_bubble()
                 if self._current_ai_widget is not None:
-                    partial = self._current_ai_widget.plain_text()
                     self._current_ai_widget.set_rendered(
-                        (partial + f"\n\n*[error: {message}]*").strip()
+                        f"*[error: {message}]*"
                     )
                     self._current_ai_widget = None
-                else:
-                    self._add_ai_bubble()
-                    if self._current_ai_widget is not None:
-                        self._current_ai_widget.set_rendered(
-                            f"*[error: {message}]*"
-                        )
-                        self._current_ai_widget = None
+            self._current_bubble_layout = None
+            self._current_copy_btn = None
             self.status_message.emit(f"AI error — {message[:80]}")
             self._unlock_input()
         except RuntimeError:
@@ -1890,20 +1745,6 @@ class AssistantView(QWidget):
             "'JetBrains Mono', 'Cascadia Mono', 'Consolas', monospace"
         )
         self.setStyleSheet(
-            # Mode toggle
-            f"QPushButton#ai_mode_btn {{"
-            f"  background: {t.bg_raised}; color: {t.text_dim};"
-            f"  border: 1px solid {t.border_lt}; border-radius: 6px;"
-            f"  padding: 6px 16px; min-height: 28px;"
-            f"  font-family: {mono}; font-size: 12px; font-weight: 700;"
-            f"}}"
-            f"QPushButton#ai_mode_btn:hover {{"
-            f"  color: {t.text}; border-color: {t.accent_dim};"
-            f"}}"
-            f"QPushButton#ai_mode_btn:checked {{"
-            f"  color: {t.accent}; border-color: {t.accent};"
-            f"  background: {t.accent_bg};"
-            f"}}"
             # Version / retry
             f"QLabel#ai_version_label {{"
             f"  color: {t.text_dim}; font-family: {mono}; font-size: 11px;"
@@ -1978,44 +1819,35 @@ class AssistantView(QWidget):
             f"QLabel#ai_banner_remedy {{"
             f"  color: {t.text_dim}; font-family: {mono}; font-size: 11px;"
             f"}}"
-            # Hints
-            f"QLabel#ai_hint {{ color: {t.text_dim}; font-size: 12px; }}"
-            # Command box
-            f"QFrame#ai_cmd_box {{"
-            f"  background: {t.bg_raised};"
-            f"  border: 1px solid {t.border_lt}; border-radius: 8px;"
+            # Inline command card
+            f"QFrame#ai_cmd_card {{"
+            f"  background: {t.bg_base};"
+            f"  border: 1px solid {t.accent_dim}; border-radius: 8px;"
+            f"  margin-top: 4px;"
             f"}}"
-            f"QLabel#ai_section_label {{"
+            f"QLabel#ai_cmd_card_label {{"
             f"  color: {t.text_dim}; font-family: {mono}; font-size: 10px;"
-            f"  font-weight: 800;"
+            f"  font-weight: 800; letter-spacing: 1px;"
             f"}}"
-            f"QLineEdit#ai_cmd_line {{"
-            f"  background: {t.bg_base}; color: {t.accent};"
+            f"QLineEdit#ai_cmd_card_line {{"
+            f"  background: {t.bg_raised}; color: {t.accent};"
             f"  border: 1px solid {t.border_lt}; border-radius: 6px;"
             f"  padding: 6px 10px; font-size: 12px;"
             f"}}"
-            f"QPushButton#ai_cmd_action {{"
-            f"  background: {t.bg_base}; color: {t.text};"
+            f"QLabel#ai_cmd_card_explain {{"
+            f"  color: {t.text}; font-size: 12px;"
+            f"}}"
+            f"QLabel#ai_cmd_card_caution {{"
+            f"  color: {t.red}; font-size: 12px; font-weight: 700;"
+            f"}}"
+            f"QPushButton#ai_cmd_card_action {{"
+            f"  background: {t.bg_raised}; color: {t.text};"
             f"  border: 1px solid {t.border_lt}; border-radius: 6px;"
             f"  padding: 5px 14px; font-size: 11px; font-weight: 700;"
             f"}}"
-            f"QPushButton#ai_cmd_action:hover {{"
+            f"QPushButton#ai_cmd_card_action:hover {{"
             f"  color: {t.accent}; border-color: {t.accent_dim};"
             f"  background: {t.accent_bg};"
-            f"}}"
-            f"QPushButton#ai_cmd_action:disabled {{"
-            f"  color: {t.text_dim}; border-color: {t.border};"
-            f"  background: transparent;"
-            f"}}"
-            f"QLabel#ai_copy_state {{"
-            f"  color: {accent2}; font-family: {mono}; font-size: 11px;"
-            f"  font-weight: 700;"
-            f"}}"
-            f"QLabel#ai_cmd_explain {{"
-            f"  color: {t.text}; font-size: 12px;"
-            f"}}"
-            f"QLabel#ai_cmd_caution {{"
-            f"  color: {accent2}; font-size: 12px; font-weight: 700;"
             f"}}"
             # History sidebar
             f"QFrame#ai_history_sidebar {{"
