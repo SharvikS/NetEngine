@@ -56,7 +56,7 @@ from PyQt6.QtGui import QFont, QTextCursor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
     QTextBrowser, QFrame, QStackedWidget, QSizePolicy, QApplication,
-    QLineEdit, QComboBox,
+    QLineEdit, QComboBox, QScrollArea, QScrollBar, QGridLayout,
 )
 
 from ai.ai_service import (
@@ -85,6 +85,35 @@ def _mono_font() -> QFont:
     f.setStyleHint(QFont.StyleHint.Monospace)
     f.setPointSizeF(10.0)
     return f
+
+
+class _SuggestionCard(QFrame):
+    """Clickable prompt suggestion card for the chat welcome screen."""
+
+    clicked = pyqtSignal(str)
+
+    def __init__(self, title: str, subtitle: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ai_suggest_card")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._prompt = subtitle
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(3)
+
+        t = QLabel(title)
+        t.setObjectName("ai_suggest_title")
+        s = QLabel(subtitle)
+        s.setObjectName("ai_suggest_desc")
+        s.setWordWrap(True)
+        lay.addWidget(t)
+        lay.addWidget(s)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._prompt)
+        super().mousePressEvent(event)
 
 
 # ── View ───────────────────────────────────────────────────────────────────
@@ -137,6 +166,9 @@ class AssistantView(QWidget):
         self._cmd_raw_buffer = ""
         self._chat_stream_buffer = ""
         self._pending_user_msg = ""
+        # Reference to the QLabel inside the AI bubble currently being
+        # streamed into. Cleared when the response finishes/cancels/fails.
+        self._current_ai_text_label: Optional[QLabel] = None
 
         # If the user hits Send before we've ever probed (or while a
         # probe is in flight), we stash the prompt here and send it
@@ -293,37 +325,44 @@ class AssistantView(QWidget):
         self._stack.addWidget(self._build_chat_panel())
         root.addWidget(self._stack, stretch=1)
 
-        # ── Bottom input row ───────────────────────────────────────
-        input_row = QHBoxLayout()
-        input_row.setSpacing(8)
+        # ── Bottom input area (unified chat-style bar) ─────────────
+        input_frame = QFrame()
+        input_frame.setObjectName("ai_input_frame")
+        input_frame_lay = QHBoxLayout(input_frame)
+        input_frame_lay.setContentsMargins(12, 8, 8, 8)
+        input_frame_lay.setSpacing(8)
 
         self._input = QPlainTextEdit()
         self._input.setObjectName("ai_input")
-        self._input.setPlaceholderText(
-            "Ask a command…  (Ctrl+Enter to send)"
-        )
-        self._input.setFixedHeight(68)
+        self._input.setPlaceholderText("Send a message…  (Ctrl+Enter)")
+        self._input.setFixedHeight(52)
         self._input.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        input_row.addWidget(self._input, stretch=1)
+        input_frame_lay.addWidget(self._input, stretch=1)
 
-        btn_col = QVBoxLayout()
-        btn_col.setSpacing(6)
-        self._btn_send = QPushButton("Send")
+        btns = QVBoxLayout()
+        btns.setSpacing(4)
+        btns.setContentsMargins(0, 0, 0, 0)
+
+        self._btn_send = QPushButton("↑")
         self._btn_send.setObjectName("ai_send_btn")
         self._btn_send.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_send.setFixedSize(36, 36)
+        self._btn_send.setToolTip("Send  (Ctrl+Enter)")
         self._btn_send.clicked.connect(self._on_send)
-        btn_col.addWidget(self._btn_send)
+        btns.addWidget(self._btn_send)
 
-        self._btn_stop = QPushButton("Stop")
+        self._btn_stop = QPushButton("■")
         self._btn_stop.setObjectName("ai_stop_btn")
         self._btn_stop.setEnabled(False)
         self._btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_stop.setFixedSize(36, 36)
+        self._btn_stop.setToolTip("Stop generation")
         self._btn_stop.clicked.connect(self._on_stop)
-        btn_col.addWidget(self._btn_stop)
-        input_row.addLayout(btn_col)
+        btns.addWidget(self._btn_stop)
 
-        root.addLayout(input_row)
+        input_frame_lay.addLayout(btns)
+        root.addWidget(input_frame)
 
         # Ctrl+Enter / Cmd+Enter sends from the input box.
         send_sc = QShortcut(QKeySequence("Ctrl+Return"), self._input)
@@ -412,35 +451,169 @@ class AssistantView(QWidget):
         return w
 
     def _build_chat_panel(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
+        lay.setSpacing(0)
 
-        top_row = QHBoxLayout()
-        hint = QLabel(
-            "Ask about scan results, terminal output, session state, "
-            "or anything in the app. Streaming responses, no cloud."
-        )
-        hint.setWordWrap(True)
-        hint.setObjectName("ai_hint")
-        top_row.addWidget(hint, stretch=1)
-
-        self._btn_clear_chat = QPushButton("Clear")
+        # Thin top bar: just the "New chat" button aligned right
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 8)
+        top.addStretch(1)
+        self._btn_clear_chat = QPushButton("+ New chat")
         self._btn_clear_chat.setObjectName("ai_clear_chat")
         self._btn_clear_chat.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_clear_chat.clicked.connect(self._on_clear_chat)
-        top_row.addWidget(self._btn_clear_chat)
+        top.addWidget(self._btn_clear_chat)
+        lay.addLayout(top)
 
-        lay.addLayout(top_row)
+        # Main stacked: welcome screen (0) vs. message bubbles (1)
+        self._chat_panel_stack = QStackedWidget()
+        self._chat_panel_stack.addWidget(self._build_welcome_widget())
 
-        self._chat_log = QTextBrowser()
-        self._chat_log.setObjectName("ai_chat_log")
-        self._chat_log.setOpenExternalLinks(True)
-        self._chat_log.setFont(_mono_font())
-        lay.addWidget(self._chat_log, stretch=1)
+        # Messages scroll area
+        self._chat_scroll = QScrollArea()
+        self._chat_scroll.setWidgetResizable(True)
+        self._chat_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._chat_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._chat_scroll.setObjectName("ai_chat_scroll")
+
+        self._chat_messages_widget = QWidget()
+        self._chat_messages_widget.setObjectName("ai_chat_messages")
+        self._chat_messages_layout = QVBoxLayout(self._chat_messages_widget)
+        self._chat_messages_layout.setContentsMargins(0, 8, 0, 8)
+        self._chat_messages_layout.setSpacing(16)
+        self._chat_messages_layout.addStretch(1)  # push bubbles to top
+
+        self._chat_scroll.setWidget(self._chat_messages_widget)
+        self._chat_panel_stack.addWidget(self._chat_scroll)
+
+        lay.addWidget(self._chat_panel_stack, stretch=1)
+        return panel
+
+    def _build_welcome_widget(self) -> QWidget:
+        w = QWidget()
+        w.setObjectName("ai_welcome")
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(24, 0, 24, 0)
+        outer.addStretch(2)
+
+        title = QLabel("NetEngine AI")
+        title.setObjectName("ai_welcome_title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        outer.addWidget(title)
+
+        sub = QLabel("How can I help you today?")
+        sub.setObjectName("ai_welcome_sub")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        outer.addWidget(sub)
+
+        outer.addSpacing(36)
+
+        cards_widget = QWidget()
+        cards_grid = QGridLayout(cards_widget)
+        cards_grid.setSpacing(10)
+        cards_grid.setContentsMargins(0, 0, 0, 0)
+
+        suggestions = [
+            ("Scan my network",     "What hosts are currently active?"),
+            ("Check open ports",    "What ports are open on 192.168.1.1?"),
+            ("SSH key setup",       "How do I set up SSH key authentication?"),
+            ("Explain scan results","What do these port scan results mean?"),
+        ]
+        for i, (card_title, card_desc) in enumerate(suggestions):
+            card = _SuggestionCard(card_title, card_desc)
+            card.clicked.connect(self._on_suggestion)
+            cards_grid.addWidget(card, i // 2, i % 2)
+
+        outer.addWidget(cards_widget, 0, Qt.AlignmentFlag.AlignHCenter)
+        outer.addStretch(3)
+
+        disclaimer = QLabel("AI can make mistakes. Always verify important information.")
+        disclaimer.setObjectName("ai_disclaimer")
+        disclaimer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        outer.addWidget(disclaimer)
+        outer.addSpacing(8)
 
         return w
+
+    def _add_user_bubble(self, text: str) -> None:
+        """Add a right-aligned user message bubble and switch to messages view."""
+        if self._chat_panel_stack.currentIndex() == 0:
+            self._chat_panel_stack.setCurrentIndex(1)
+
+        row = QWidget()
+        row_lay = QHBoxLayout(row)
+        row_lay.setContentsMargins(8, 0, 8, 0)
+        row_lay.addStretch(1)
+
+        bubble = QFrame()
+        bubble.setObjectName("ai_user_bubble")
+
+        b_lay = QVBoxLayout(bubble)
+        b_lay.setContentsMargins(14, 10, 14, 10)
+        b_lay.setSpacing(0)
+
+        lbl = QLabel(text)
+        lbl.setObjectName("ai_bubble_text_user")
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        lbl.setMaximumWidth(560)
+        b_lay.addWidget(lbl)
+
+        row_lay.addWidget(bubble)
+        self._chat_messages_layout.addWidget(row)
+        self._scroll_chat_to_bottom()
+
+    def _add_ai_bubble(self) -> None:
+        """Add a left-aligned AI response bubble and set _current_ai_text_label."""
+        row = QWidget()
+        row_lay = QHBoxLayout(row)
+        row_lay.setContentsMargins(8, 0, 8, 0)
+
+        bubble = QFrame()
+        bubble.setObjectName("ai_ai_bubble")
+
+        b_lay = QVBoxLayout(bubble)
+        b_lay.setContentsMargins(14, 10, 14, 10)
+        b_lay.setSpacing(4)
+
+        role_lbl = QLabel("AI")
+        role_lbl.setObjectName("ai_bubble_role")
+        b_lay.addWidget(role_lbl)
+
+        lbl = QLabel("")
+        lbl.setObjectName("ai_bubble_text_ai")
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        lbl.setMaximumWidth(640)
+        lbl.setMinimumWidth(80)
+        b_lay.addWidget(lbl)
+
+        row_lay.addWidget(bubble)
+        row_lay.addStretch(1)
+
+        self._chat_messages_layout.addWidget(row)
+        self._current_ai_text_label = lbl
+        self._scroll_chat_to_bottom()
+
+    def _scroll_chat_to_bottom(self) -> None:
+        """Scroll the chat area to the bottom after a tick."""
+        def _do():
+            if not self._shutting_down:
+                sb = self._chat_scroll.verticalScrollBar()
+                sb.setValue(sb.maximum())
+        QTimer.singleShot(0, _do)
+
+    def _on_suggestion(self, text: str) -> None:
+        """Fill the input with a suggestion card prompt and send."""
+        self._input.setPlainText(text)
+        self._input.setFocus()
+        if self._status is not None and self._status.state == "ok":
+            self._on_send()
 
     # ── Mode switching ─────────────────────────────────────────────
 
@@ -461,9 +634,9 @@ class AssistantView(QWidget):
         self._btn_mode_chat.setChecked(mode == "chat")
         self._stack.setCurrentIndex(0 if mode == "command" else 1)
         self._input.setPlaceholderText(
-            "Ask a command…  (Ctrl+Enter to send)"
+            "Ask for a command…  (Ctrl+Enter)"
             if mode == "command"
-            else "Ask for help…  (Ctrl+Enter to send)"
+            else "Send a message…  (Ctrl+Enter)"
         )
 
     # ── Status probe (async) ───────────────────────────────────────
@@ -569,11 +742,12 @@ class AssistantView(QWidget):
             return
 
         title_by_state = {
-            "disabled":    "Local AI disabled",
-            "unreachable": "Ollama not reachable",
-            "no_model":    "Model not installed",
-            "timeout":     "Ollama timed out",
-            "error":       "Local AI error",
+            "disabled":    "AI disabled",
+            "unreachable": "AI not reachable",
+            "no_key":      "API key required",
+            "no_model":    "Model not available",
+            "timeout":     "AI timed out",
+            "error":       "AI error",
         }
         self._banner.setVisible(True)
         self._banner_title.setText(
@@ -589,7 +763,7 @@ class AssistantView(QWidget):
         # primary tool for recovering (pick a model that *is*
         # installed). Refresh stays available in all non-disabled
         # states so the user can re-check after starting Ollama.
-        if status.state in ("unreachable", "timeout", "disabled", "error"):
+        if status.state in ("unreachable", "timeout", "disabled", "error", "no_key"):
             self._model_combo.setEnabled(False)
         else:
             self._model_combo.setEnabled(True)
@@ -1001,10 +1175,8 @@ class AssistantView(QWidget):
     def _start_chat_request(self, prompt: str) -> None:
         self._pending_user_msg = prompt
         self._chat_stream_buffer = ""
-        # Append the user's message to the log immediately so the
-        # exchange feels reactive even before the first streamed token.
-        self._append_chat_role("you", prompt)
-        self._append_chat_role("assistant", "")
+        self._add_user_bubble(prompt)
+        self._add_ai_bubble()
         self._input.clear()
 
         worker = make_chat_worker(self._service, prompt)
@@ -1024,11 +1196,9 @@ class AssistantView(QWidget):
             return
         try:
             self._chat_stream_buffer += piece
-            cursor = self._chat_log.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            cursor.insertText(piece)
-            self._chat_log.setTextCursor(cursor)
-            self._chat_log.ensureCursorVisible()
+            if self._current_ai_text_label is not None:
+                self._current_ai_text_label.setText(self._chat_stream_buffer)
+            self._scroll_chat_to_bottom()
         except RuntimeError:
             return
 
@@ -1041,11 +1211,10 @@ class AssistantView(QWidget):
                     self._pending_user_msg, full,
                 )
             except Exception:
-                # Never let a history bookkeeping error surface to the
-                # user or block the UI unlock.
                 pass
         try:
-            self._append_chat_role(None, "")  # trailing blank line
+            self._current_ai_text_label = None
+            self._scroll_chat_to_bottom()
             self._unlock_input()
         except RuntimeError:
             return
@@ -1054,20 +1223,26 @@ class AssistantView(QWidget):
         if self._shutting_down or worker is not self._current_worker:
             return
         try:
-            # Cancelled responses do NOT get recorded — a partial answer
-            # in history would corrupt the next exchange's context.
-            cursor = self._chat_log.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            cursor.insertText("\n[cancelled]\n")
-            self._chat_log.setTextCursor(cursor)
-            self._chat_log.ensureCursorVisible()
+            if self._current_ai_text_label is not None:
+                existing = self._current_ai_text_label.text()
+                self._current_ai_text_label.setText(
+                    (existing + "\n\n[cancelled]").strip()
+                )
+                self._current_ai_text_label = None
             self._unlock_input()
         except RuntimeError:
             return
 
     def _on_clear_chat(self) -> None:
         self._on_stop()
-        self._chat_log.clear()
+        # Remove all bubble widgets from the messages layout
+        while self._chat_messages_layout.count():
+            item = self._chat_messages_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._chat_messages_layout.addStretch(1)
+        self._current_ai_text_label = None
+        self._chat_panel_stack.setCurrentIndex(0)
         self._service.chat_assistant.clear()
 
     def _append_chat_role(
@@ -1098,18 +1273,23 @@ class AssistantView(QWidget):
                 self._btn_copy.setEnabled(False)
                 self._btn_insert.setEnabled(False)
             else:
-                self._append_chat_role(None, "")
-                cursor = self._chat_log.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                cursor.insertText(f"[error] {message}\n")
-                self._chat_log.setTextCursor(cursor)
+                if self._current_ai_text_label is not None:
+                    existing = self._current_ai_text_label.text()
+                    self._current_ai_text_label.setText(
+                        (existing + f"\n\n[error: {message}]").strip()
+                    )
+                    self._current_ai_text_label = None
+                else:
+                    self._add_ai_bubble()
+                    if self._current_ai_text_label is not None:
+                        self._current_ai_text_label.setText(
+                            f"[error: {message}]"
+                        )
+                        self._current_ai_text_label = None
             self.status_message.emit(f"AI error — {message[:80]}")
             self._unlock_input()
         except RuntimeError:
             return
-        # A failure means the connection or model is likely broken —
-        # re-run the status probe (async!) so the banner updates
-        # accordingly. The UI stays responsive throughout.
         self._kick_probe(force=True)
 
     # ── Theme ──────────────────────────────────────────────────────
@@ -1247,47 +1427,97 @@ class AssistantView(QWidget):
             f"QLabel#ai_cmd_caution {{"
             f"  color: {accent2}; font-size: 12px; font-weight: 700;"
             f"}}"
-            # Chat log
-            f"QTextBrowser#ai_chat_log {{"
-            f"  background: {t.bg_base}; color: {t.text};"
-            f"  border: 1px solid {t.border_lt}; border-radius: 8px;"
-            f"  padding: 10px;"
-            f"}}"
+            # Chat panel — new chat interface
             f"QPushButton#ai_clear_chat {{"
             f"  background: transparent; color: {t.text_dim};"
-            f"  border: 1px solid {t.border_lt}; border-radius: 4px;"
-            f"  padding: 4px 12px; font-size: 11px;"
+            f"  border: 1px solid {t.border_lt}; border-radius: 6px;"
+            f"  padding: 5px 14px; font-size: 11px; font-weight: 600;"
             f"}}"
             f"QPushButton#ai_clear_chat:hover {{"
             f"  color: {t.accent}; border-color: {t.accent_dim};"
             f"}}"
-            # Input + action buttons
-            f"QPlainTextEdit#ai_input {{"
-            f"  background: {t.bg_input}; color: {t.text};"
-            f"  border: 1px solid {t.border_lt}; border-radius: 8px;"
-            f"  padding: 8px 10px; font-family: {mono}; font-size: 12px;"
+            # Welcome screen
+            f"QWidget#ai_welcome {{ background: transparent; }}"
+            f"QLabel#ai_welcome_title {{"
+            f"  color: {t.text};"
+            f"  font-family: {mono}; font-size: 26px; font-weight: 900;"
+            f"  letter-spacing: 1px;"
             f"}}"
-            f"QPlainTextEdit#ai_input:focus {{"
+            f"QLabel#ai_welcome_sub {{"
+            f"  color: {t.text_dim}; font-size: 14px;"
+            f"}}"
+            f"QLabel#ai_disclaimer {{"
+            f"  color: {t.text_dim}; font-size: 10px;"
+            f"}}"
+            # Suggestion cards
+            f"QFrame#ai_suggest_card {{"
+            f"  background: {t.bg_raised};"
+            f"  border: 1px solid {t.border_lt}; border-radius: 10px;"
+            f"  min-width: 220px; max-width: 300px;"
+            f"}}"
+            f"QFrame#ai_suggest_card:hover {{"
+            f"  border-color: {t.accent_dim}; background: {t.accent_bg};"
+            f"}}"
+            f"QLabel#ai_suggest_title {{"
+            f"  color: {t.text}; font-size: 12px; font-weight: 700;"
+            f"}}"
+            f"QLabel#ai_suggest_desc {{"
+            f"  color: {t.text_dim}; font-size: 11px;"
+            f"}}"
+            # Chat scroll area + messages container
+            f"QScrollArea#ai_chat_scroll {{ background: transparent; border: none; }}"
+            f"QWidget#ai_chat_messages {{ background: transparent; }}"
+            # User bubble (right side)
+            f"QFrame#ai_user_bubble {{"
+            f"  background: {t.accent_bg};"
+            f"  border: 1px solid {t.accent_dim}; border-radius: 16px;"
+            f"  border-bottom-right-radius: 4px;"
+            f"}}"
+            f"QLabel#ai_bubble_text_user {{"
+            f"  color: {t.text}; font-size: 13px;"
+            f"}}"
+            # AI bubble (left side)
+            f"QFrame#ai_ai_bubble {{"
+            f"  background: {t.bg_raised};"
+            f"  border: 1px solid {t.border_lt}; border-radius: 16px;"
+            f"  border-bottom-left-radius: 4px;"
+            f"}}"
+            f"QLabel#ai_bubble_role {{"
+            f"  color: {t.accent}; font-family: {mono}; font-size: 10px;"
+            f"  font-weight: 800; letter-spacing: 1px;"
+            f"}}"
+            f"QLabel#ai_bubble_text_ai {{"
+            f"  color: {t.text}; font-size: 13px;"
+            f"}}"
+            # Unified input frame
+            f"QFrame#ai_input_frame {{"
+            f"  background: {t.bg_input};"
+            f"  border: 1px solid {t.border_lt}; border-radius: 14px;"
+            f"}}"
+            f"QFrame#ai_input_frame:focus-within {{"
             f"  border-color: {t.accent};"
             f"}}"
-            f"QPushButton#ai_send_btn {{"
-            f"  background: {t.accent_bg}; color: {t.accent};"
-            f"  border: 1px solid {t.accent}; border-radius: 6px;"
-            f"  padding: 8px 20px; min-width: 72px;"
-            f"  font-family: {mono}; font-size: 12px; font-weight: 800;"
+            f"QPlainTextEdit#ai_input {{"
+            f"  background: transparent; color: {t.text};"
+            f"  border: none;"
+            f"  font-family: {mono}; font-size: 13px;"
             f"}}"
-            f"QPushButton#ai_send_btn:hover {{ background: {t.bg_hover}; }}"
+            f"QPushButton#ai_send_btn {{"
+            f"  background: {t.accent}; color: {t.bg_base};"
+            f"  border: none; border-radius: 18px;"
+            f"  font-size: 18px; font-weight: 900; padding: 0px;"
+            f"}}"
+            f"QPushButton#ai_send_btn:hover:enabled {{ opacity: 0.85; }}"
             f"QPushButton#ai_send_btn:disabled {{"
-            f"  color: {t.text_dim}; border-color: {t.border};"
-            f"  background: transparent;"
+            f"  background: {t.bg_raised}; color: {t.text_dim};"
             f"}}"
             f"QPushButton#ai_stop_btn {{"
             f"  background: transparent; color: {t.text_dim};"
-            f"  border: 1px solid {t.border_lt}; border-radius: 6px;"
-            f"  padding: 6px 16px; font-size: 11px; font-weight: 700;"
+            f"  border: 1px solid {t.border_lt}; border-radius: 18px;"
+            f"  font-size: 10px; font-weight: 900; padding: 0px;"
             f"}}"
             f"QPushButton#ai_stop_btn:hover:enabled {{"
-            f"  color: {t.red}; border-color: {t.red};"
+            f"  color: {t.red}; border-color: {t.red}; background: transparent;"
             f"}}"
         )
 
